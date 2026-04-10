@@ -1,34 +1,71 @@
 # ORCA Fire Detector Control
 
-Qt-based parameter control GUI for Hamamatsu ORCA Fire cameras using Euresys CoaXPress frame grabbers. Automatically falls back to simulation mode when no camera hardware is available.
+Hamamatsu ORCA Fire camera control via Euresys CoaXPress frame grabbers, using harvesters/GenTL (no DCAM-SDK). Includes a standalone Qt GUI and an areaDetector-compatible EPICS IOC for tomoscan integration.
 
 ## Setup
 
 ```bash
 conda create -n detector python=3.11
 conda activate detector
-pip install numpy PyQt5
+pip install numpy PyQt5 harvesters
 
-# For real camera support:
-pip install harvesters
+# For EPICS IOC / tomoscan support:
+pip install caproto h5py
 
-# For TIFF export:
+# For TIFF export from GUI:
 pip install imageio
 ```
 
-## Usage
+## Standalone Qt GUI
 
 ```bash
 python orca/qt_detector.py
 ```
 
-With a specific GenTL producer path:
+Falls back to simulation mode when no camera is connected. The GUI shows a green/red indicator for camera status.
+
+## EPICS IOC for tomoscan
+
+Start the areaDetector-compatible PV server:
 
 ```bash
-python orca/qt_detector.py --gentl-path /opt/euresys/GenTL/Producer/libEuresysGenTL.so
+python run_orca_ioc.py --prefix ORCA:
 ```
 
-The GUI shows a green/red indicator for camera connection status. When no hardware is found, simulation mode generates test pattern frames.
+This serves standard `cam1:` and `HDF1:` PVs that tomoscan expects:
+
+```bash
+# List all PVs
+python run_orca_ioc.py --list-pvs
+
+# Example PVs served:
+#   ORCA:cam1:Acquire           Start/stop acquisition
+#   ORCA:cam1:AcquireTime       Exposure time (seconds)
+#   ORCA:cam1:TriggerMode       Off / On (external)
+#   ORCA:cam1:TriggerSoftware   Software trigger (for step scan)
+#   ORCA:HDF1:Capture           Start/stop HDF5 capture
+#   ORCA:HDF1:FilePath          Output directory
+#   ORCA:HDF1:FileName          Output filename base
+```
+
+### tomoscan configuration
+
+In the tomoscan EPICS database substitutions:
+
+```
+CameraPVPrefix      = ORCA:
+FilePluginPVPrefix  = ORCA:HDF1:
+```
+
+Step scan mode (`TomoScanSTEP`) uses `cam1:TriggerSoftware` to fire each frame.
+
+## Environment check
+
+Verify all dependencies and hardware on the target machine:
+
+```bash
+python check_environment.py
+```
 
 ## Files
 
@@ -37,3 +74,6 @@ The GUI shows a green/red indicator for camera connection status. When no hardwa
 | `orca/qt_detector.py` | Qt GUI for parameter control and status monitoring |
 | `orca/dummy_detector.py` | Detector backend (real camera + simulation fallback) |
 | `orca/harvesters_orca_fire.py` | Low-level camera acquisition via GenTL/harvesters |
+| `orca/epics_ad_server.py` | areaDetector-compatible EPICS PV server (cam1 + HDF1) |
+| `run_orca_ioc.py` | EPICS IOC runner script |
+| `check_environment.py` | Pre-flight environment checker |

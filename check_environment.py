@@ -57,29 +57,39 @@ def main():
         print("  [FAIL] GenTL producer: not found in standard paths")
         print("         Install Euresys eGrabber or set EURESYS_GENTL_PRODUCER env var")
 
-    # Camera detection
+    # Frame grabber and camera detection
     if has_harvesters and gentl_found:
-        print("\n--- Camera detection ---")
+        print("\n--- Frame grabber & camera detection ---")
         try:
             from harvesters.core import Harvester
             h = Harvester()
             h.add_file(gentl_found)
             h.update()
+
+            # Show system/interface info if available
+            try:
+                for i, iface in enumerate(h.interface_info_list):
+                    print(f"  [OK]  Interface {i}: {iface.id} ({iface.display_name})")
+            except Exception:
+                print(f"  [OK]  GenTL producer loaded: {gentl_found}")
+
             devices = h.device_info_list
             if devices:
                 for i, d in enumerate(devices):
-                    print(f"  [OK]  Device {i}: {d.vendor} {d.model} (SN: {d.serial_number})")
+                    print(f"  [OK]  Camera {i}: {d.vendor} {d.model} (SN: {d.serial_number})")
             else:
-                print("  [WARN] No cameras detected (frame grabber found but no camera connected)")
+                print("  [WARN] No cameras detected — frame grabber OK but no camera connected")
+                print("         Connect camera and power it on, then re-run this check")
+
             h.reset()
         except Exception as e:
-            print(f"  [FAIL] Camera enumeration: {e}")
+            print(f"  [FAIL] Enumeration failed: {e}")
     elif not has_harvesters:
-        print("\n--- Camera detection ---")
-        print("  [SKIP] harvesters not installed, cannot detect cameras")
+        print("\n--- Frame grabber & camera detection ---")
+        print("  [SKIP] harvesters not installed, cannot detect hardware")
     elif not gentl_found:
-        print("\n--- Camera detection ---")
-        print("  [SKIP] No GenTL producer, cannot detect cameras")
+        print("\n--- Frame grabber & camera detection ---")
+        print("  [SKIP] No GenTL producer (.cti) found, cannot detect hardware")
 
     # Summary
     print("\n" + "=" * 50)

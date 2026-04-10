@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "orca-detector"
 version = "0.1.0"
-description = "Qt control GUI for Hamamatsu ORCA Fire cameras with Euresys frame grabbers"
+description = "ORCA Fire camera control: Qt GUI + areaDetector-compatible EPICS IOC via harvesters/GenTL"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.8"
@@ -30,12 +30,17 @@ dependencies = [
 camera = [
     "harvesters>=1.4.0",
 ]
+epics = [
+    "caproto>=1.3.0",
+    "h5py>=3.0.0",
+]
 save = [
     "imageio>=2.19.0",
 ]
 
 [project.scripts]
 orca-qt = "orca.qt_detector:main"
+orca-ioc = "run_orca_ioc:main"
 
 [project.urls]
 Homepage = "https://github.com/mittoalb/detector"
