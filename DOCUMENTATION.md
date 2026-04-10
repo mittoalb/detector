@@ -235,11 +235,24 @@ For testing parameter control without EPICS:
 python orca/dummy_detector.py
 ```
 
-Features:
-- Live parameter adjustment
-- Image preview with test patterns
-- Frame rate monitoring
-- Save frames to TIFF
+**New Modern Interface Features:**
+- **📹 Live View Tab**: Real-time image display with downsampled preview
+- **⚙️ Parameters Tab**: Organized parameter controls in logical groups:
+  - Timing (Exposure, Frame Rate, etc.)
+  - Image Size & ROI (Width, Height, Binning, etc.)
+  - Acquisition Control (Trigger modes, Image count)
+  - Image Processing (Gain, Gamma, Readout speed)
+- **📊 Status Tab**: Live status display and activity logging
+- **🎛️ Control Bar**: Quick access buttons for Start/Stop/Single Frame
+- **💾 Save Frame**: Export acquired frames as TIFF files
+- **🔄 Real-time Updates**: Parameters and status update automatically
+
+**Key Improvements:**
+- Modern tabbed interface similar to pystream
+- Live image preview with intensity scaling
+- Organized parameter groups with units
+- Comprehensive logging and status display
+- Save functionality for captured frames
 
 ## Architecture Details
 

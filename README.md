@@ -34,7 +34,11 @@ This package provides EPICS areaDetector-like access to Hamamatsu ORCA Fire came
 python orca/dummy_detector.py
 ```
 
-This opens a GUI for testing parameter control without hardware.
+This opens a modern pystream-style GUI with:
+- Live image preview and frame counter
+- Organized parameter controls in tabs
+- Real-time status monitoring
+- Frame saving capabilities
 
 ### Real Camera with EPICS (Simulation Mode)
 
