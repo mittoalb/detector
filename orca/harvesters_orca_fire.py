@@ -15,10 +15,9 @@ class OrcaFireAcquirer:
     """
 
     DEFAULT_GENTL_LIBRARY_CANDIDATES = [
-        "/opt/euresys/GenTL/Producer/libEuresysGenTL.so",
-        "/opt/euresys/GenTL/Producer/x86_64/libEuresysGenTL.so",
-        "/usr/local/lib/libEuresysGenTL.so",
-        "/usr/lib/libEuresysGenTL.so",
+        "/opt/euresys/egrabber/lib/x86_64/coaxlink.cti",
+        "/opt/euresys/egrabber/lib/coaxlink.cti",
+        "/opt/euresys/GenTL/Producer/x86_64/coaxlink.cti",
     ]
 
     def __init__(
