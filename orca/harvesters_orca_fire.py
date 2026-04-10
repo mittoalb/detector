@@ -53,6 +53,7 @@ class OrcaFireAcquirer:
         self._frame_callbacks: List[Callable[[np.ndarray], None]] = []
         self._stream_thread: Optional[threading.Thread] = None
         self._stream_event = threading.Event()
+        self._frame_counter = 0
 
     @classmethod
     def _find_default_gentl_producer(cls) -> Optional[str]:
@@ -173,11 +174,11 @@ class OrcaFireAcquirer:
         while self._stream_event.is_set() and self._is_acquiring:
             try:
                 frame = self.acquire_frame(timeout_ms=timeout_ms)
+                self._frame_counter += 1
                 metadata = {
                     "timestamp": time.time(),
-                    "frame_number": getattr(self, "_frame_counter", 0) + 1,
+                    "frame_number": self._frame_counter,
                 }
-                setattr(self, "_frame_counter", metadata["frame_number"])
             except Exception:
                 time.sleep(0.01)
                 continue
@@ -254,7 +255,7 @@ def example():
     config = {
         "ExposureTime": 1000.0,
         "Width": 4432,
-        "Height": 2369,
+        "Height": 2368,
         "OffsetX": 0,
         "OffsetY": 0,
         "AcquisitionFrameRate": 30.0,

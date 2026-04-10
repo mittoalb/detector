@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "orca-detector"
 version = "0.1.0"
-description = "EPICS areaDetector for Hamamatsu ORCA Fire cameras with Euresys frame grabbers"
+description = "Qt control GUI for Hamamatsu ORCA Fire cameras with Euresys frame grabbers"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.8"
@@ -22,25 +22,20 @@ classifiers = [
     "Topic :: System :: Hardware :: Hardware Drivers",
 ]
 dependencies = [
-    "harvesters>=1.4.0",
-    "caproto>=1.3.0",
     "numpy>=1.21.0",
-    "imageio>=2.19.0",
+    "PyQt5>=5.15.0",
 ]
 
 [project.optional-dependencies]
-dev = [
-    "pytest>=7.0.0",
-    "black>=22.0.0",
-    "flake8>=4.0.0",
-    "mypy>=0.950",
+camera = [
+    "harvesters>=1.4.0",
 ]
-viewer = [
-    "pystream>=0.1.0",
+save = [
+    "imageio>=2.19.0",
 ]
 
 [project.scripts]
-orca-epics = "run_orca_epics:main"
+orca-qt = "orca.qt_detector:main"
 
 [project.urls]
 Homepage = "https://github.com/mittoalb/detector"
@@ -50,9 +45,6 @@ Issues = "https://github.com/mittoalb/detector/issues"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["orca*"]
-
-[tool.setuptools.package-data]
-orca = ["*.py"]
 
 [tool.black]
 line-length = 88
