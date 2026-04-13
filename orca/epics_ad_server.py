@@ -559,6 +559,7 @@ class OrcaFireIOC(PVGroup):
     def __init__(self, *args,
                  gen_tl_producer_path: Optional[str] = None,
                  device_index: int = 0,
+                 pva_pv: Optional[str] = None,
                  **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -582,11 +583,12 @@ class OrcaFireIOC(PVGroup):
 
         # Start PVA NTNDArray server for pystream
         prefix = self.prefix if hasattr(self, "prefix") else "ORCA:"
+        if pva_pv is None:
+            pva_pv = prefix + "image1:ArrayData"
         self._pva_server = None
         try:
-            self._pva_server = NTNDArrayServer(prefix + "image1:ArrayData")
+            self._pva_server = NTNDArrayServer(pva_pv)
             self.cam1.register_frame_callback(self._pva_server.publish_frame)
-            logger.info("PVA NTNDArray server started on %simage1:ArrayData",
-                        prefix)
+            logger.info("PVA NTNDArray server: %s", pva_pv)
         except Exception as exc:
             logger.warning("PVA server not available: %s", exc)

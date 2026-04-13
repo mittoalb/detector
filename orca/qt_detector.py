@@ -189,6 +189,13 @@ class QtOrcaFireDetectorGui(QtWidgets.QMainWindow):
             status_label = QtWidgets.QLabel(str(self.detector.get_parameter(name)))
             status_layout.addRow(label + ":", status_label)
             self.status_labels[name] = status_label
+
+        # PVA stream PV name (editable)
+        self.pva_pv_edit = QtWidgets.QLineEdit("")
+        self.pva_pv_edit.setPlaceholderText("e.g. ORCA:image1:ArrayData")
+        self.pva_pv_edit.setToolTip("PVAccess NTNDArray PV name for pystream")
+        self.pva_pv_edit.setReadOnly(True)
+        status_layout.addRow("PVA Stream:", self.pva_pv_edit)
         right_layout.addWidget(status_box)
 
         controls_panel = QtWidgets.QGroupBox("Quick Actions")

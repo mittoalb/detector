@@ -55,6 +55,11 @@ def main():
         "--gui", action="store_true",
         help="Also launch the Qt parameter control GUI",
     )
+    parser.add_argument(
+        "--pva-pv",
+        help="PVAccess NTNDArray PV name for pystream "
+             "(default: {prefix}image1:ArrayData)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -69,6 +74,7 @@ def main():
         prefix=args.prefix,
         gen_tl_producer_path=args.gentl_path,
         device_index=args.device_index,
+        pva_pv=args.pva_pv,
     )
 
     if args.list_pvs:
@@ -111,6 +117,9 @@ def _run_gui(ioc: OrcaFireIOC):
     app = QtWidgets.QApplication(sys.argv)
     backend = IOCBackend(ioc)
     window = QtOrcaFireDetectorGui(backend)
+    # Show the PVA stream PV name if the server is running
+    if ioc._pva_server is not None:
+        window.pva_pv_edit.setText(ioc._pva_server._pv_name)
     window.show()
     sys.exit(app.exec())
 
