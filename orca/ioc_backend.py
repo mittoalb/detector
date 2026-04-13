@@ -145,6 +145,27 @@ class IOCBackend(DummyOrcaFireDetector):
         elif name == "TriggerMode":
             self._cam.TriggerMode._data["value"] = str(value)
             self._cam.TriggerMode_RBV._data["value"] = str(value)
+            if acquirer:
+                mode = "Off" if str(value) == "Off" else "On"
+                acquirer.set_trigger_mode(mode)
+        elif name == "TriggerSource":
+            self._cam.TriggerSource._data["value"] = str(value)
+            if acquirer:
+                source_map = {
+                    "Internal": None,
+                    "External": "TTLIO11",
+                    "BNC": "TTLIO11",
+                    "Software": "Software",
+                }
+                src = source_map.get(str(value))
+                if src == "Software":
+                    acquirer.set_trigger_mode("Software")
+                elif src:
+                    acquirer.configure_external_trigger(source=src)
+        elif name == "TriggerPolarity":
+            if acquirer:
+                act = "RisingEdge" if str(value) == "Positive" else "FallingEdge"
+                acquirer.configure_external_trigger(activation=act)
         elif name == "AcquisitionMode":
             mode_map = {"Continuous": "Continuous", "SingleFrame": "Single",
                         "MultiFrame": "Multiple"}

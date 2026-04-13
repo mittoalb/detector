@@ -56,6 +56,7 @@ class OrcaFireAcquirer:
         self._stream_thread: Optional[threading.Thread] = None
         self._stream_event = threading.Event()
         self._frame_counter = 0
+        self._trigger_mode = "Off"
 
     @classmethod
     def _find_default_gentl_producer(cls) -> Optional[str]:
@@ -154,6 +155,52 @@ class OrcaFireAcquirer:
                 logger.info("Stream %s = %s", name, value)
             except Exception as exc:
                 logger.warning("Failed to set stream %s: %s", name, exc)
+
+    # -- Frame grabber trigger control --
+
+    def set_trigger_mode(self, mode: str) -> None:
+        """Set trigger mode via frame grabber.
+
+        Args:
+            mode: 'Off' (free-run), 'On' (external trigger), 'Software'
+        """
+        if self._image_acquirer is None:
+            raise RuntimeError("Camera is not open.")
+        dnm = self._image_acquirer.device.node_map
+        if mode == "Off":
+            dnm.CameraControlMethod.value = "NC"
+            self._trigger_mode = "Off"
+        else:
+            dnm.CameraControlMethod.value = "RG"
+            if mode == "Software":
+                dnm.CycleTriggerSource.value = "StartCycle"
+            else:  # External
+                dnm.CycleTriggerSource.value = "LIN1"
+            self._trigger_mode = mode
+        logger.info("Trigger mode: %s", mode)
+
+    def configure_external_trigger(self, source: str = "TTLIO11",
+                                   activation: str = "RisingEdge") -> None:
+        """Configure external trigger input on the frame grabber.
+
+        Args:
+            source: I/O line name (TTLIO11, DIN11, IIN11, etc.)
+            activation: 'RisingEdge', 'FallingEdge', 'Both'
+        """
+        if self._image_acquirer is None:
+            raise RuntimeError("Camera is not open.")
+        ifnm = self._image_acquirer.device.parent.node_map
+        ifnm.LineInputToolSelector.value = "LIN1"
+        ifnm.LineInputToolSource.value = source
+        ifnm.LineInputToolActivation.value = activation
+        logger.info("External trigger: %s %s → LIN1", source, activation)
+
+    def software_trigger(self) -> None:
+        """Fire a single software trigger."""
+        if self._image_acquirer is None:
+            raise RuntimeError("Camera is not open.")
+        dnm = self._image_acquirer.device.node_map
+        dnm.StartCycle.execute()
 
     def _set_node_value(self, node_map, name: str, value: float) -> None:
         if not hasattr(node_map, name):

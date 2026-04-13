@@ -40,7 +40,7 @@ class CamPlugin(PVGroup):
     # --- Acquisition control ---
     Acquire = pvproperty(value=0, dtype=int)
     AcquireBusy = pvproperty(value=0, dtype=int, read_only=True)
-    ImageMode = pvproperty(value="Continuous", dtype=ChannelType.STRING)
+    ImageMode = pvproperty(value="Continuous", dtype=str, max_length=40)
     NumImages = pvproperty(value=1, dtype=int)
     NumImagesCounter_RBV = pvproperty(value=0, dtype=int, read_only=True)
     ArrayCounter_RBV = pvproperty(value=0, dtype=int, read_only=True)
@@ -193,6 +193,12 @@ class CamPlugin(PVGroup):
     async def TriggerSoftware(self, instance, value):
         if value == 1:
             self._software_trigger_event.set()
+            # Also fire frame grabber software trigger if available
+            if self._acquirer and hasattr(self._acquirer, 'software_trigger'):
+                try:
+                    self._acquirer.software_trigger()
+                except Exception:
+                    pass
         return value
 
     def _start_acquisition(self):
@@ -237,6 +243,7 @@ class CamPlugin(PVGroup):
                 image_mode = str(self.ImageMode.value)
                 num_images = int(self.NumImages.value)
                 acquire_time = float(self.AcquireTime.value)
+                trigger_mode = str(self.TriggerMode.value)
 
                 # Determine how many frames to collect
                 if image_mode == "Single":
@@ -249,8 +256,11 @@ class CamPlugin(PVGroup):
                 if target > 0 and self._frame_counter >= target:
                     break
 
-                # Wait for software trigger if in external/software trigger mode
-                if trigger_mode in ("External", "On"):
+                # In external/software trigger mode with no real camera,
+                # wait for the internal software trigger event (simulation).
+                # With a real camera, the frame grabber handles triggering
+                # and acquire_frame() will block until a triggered frame arrives.
+                if trigger_mode in ("External", "On") and not self._acquirer:
                     self._software_trigger_event.clear()
                     self._software_trigger_event.wait(timeout=5.0)
                     if not self._acquiring:
@@ -297,8 +307,8 @@ class CamPlugin(PVGroup):
                 except Exception:
                     pass
             self._acquiring = False
-            self.AcquireBusy._data["value"] = 0
-            self.Acquire._data["value"] = 0
+            self._publish(self.AcquireBusy, 0)
+            self._publish(self.Acquire, 0)
             logger.info("Acquisition stopped after %d frames", self._frame_counter)
 
     def _acquire_one_frame(self, acquire_time: float) -> Optional[np.ndarray]:
