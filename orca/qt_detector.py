@@ -229,13 +229,16 @@ class QtOrcaFireDetectorGui(QtWidgets.QMainWindow):
         "TimingReadoutTime", "TimingCyclicTriggerPeriod", "InternalFrameRate",
         "SensorCoolerStatus", "SensorTemperature",
         "ImageCounter", "StatusMessage",
+        # Fixed by camera hardware (ORCA Fire C16240-20UP)
+        "Width", "Height", "OffsetX", "OffsetY",
+        "PixelFormat",
     }
 
     def _create_parameter_tabs(self) -> None:
         """Create tabbed parameter groups."""
         groups = {
             "Exposure & Acquisition": [
-                ("ExposureTime", "Exposure Time (µs)"),
+                ("ExposureTime", "Exposure Time (s)"),
                 ("AcquisitionMode", "Acq. Mode"),
                 ("AcquisitionFrameRate", "Frame Rate (Hz)"),
                 ("AcquisitionFrameCount", "Frame Count"),
@@ -350,12 +353,18 @@ class QtOrcaFireDetectorGui(QtWidgets.QMainWindow):
                         combo.setCurrentIndex(idx)
                     if key in self.READ_ONLY_PARAMS:
                         combo.setEnabled(False)
+                    else:
+                        combo.currentIndexChanged.connect(
+                            lambda _, k=key: self._apply_single(k))
                     self.controls[key] = combo
                     form_layout.addRow(label_text + ":", combo)
                 else:
                     edit = QtWidgets.QLineEdit(str(current_value))
                     if key in self.READ_ONLY_PARAMS:
                         edit.setReadOnly(True)
+                    else:
+                        edit.returnPressed.connect(
+                            lambda k=key: self._apply_single(k))
                     self.controls[key] = edit
                     form_layout.addRow(label_text + ":", edit)
 
@@ -386,7 +395,7 @@ class QtOrcaFireDetectorGui(QtWidgets.QMainWindow):
     def _handle_frame_ready(self, frame: Any, metadata: Dict[str, Any]) -> None:
         self.last_frame = frame
         self._update_status_from_metadata(metadata)
-        self._log(f"Frame ready: {frame.shape}, Exposure {metadata['ExposureTime']} μs")
+        self._log(f"Frame ready: {frame.shape}, Exposure {metadata['ExposureTime']} s")
 
     def _update_status_from_metadata(self, metadata: Dict[str, Any]) -> None:
         if "ImageCounter" in self.status_labels:
@@ -394,7 +403,34 @@ class QtOrcaFireDetectorGui(QtWidgets.QMainWindow):
         if "StatusMessage" in self.status_labels:
             self.status_labels["StatusMessage"].setText(str(metadata.get("StatusMessage", "Acquiring")))
 
+    def _apply_single(self, key: str) -> None:
+        """Apply a single parameter immediately (on Enter or combo change)."""
+        widget = self.controls[key]
+        try:
+            if isinstance(widget, QtWidgets.QComboBox):
+                value = widget.currentData()
+            else:
+                text = widget.text().strip()
+                if not text:
+                    return
+                current_value = self.detector.get_parameter(key)
+                if isinstance(current_value, bool):
+                    value = text.lower() in ("1", "true", "yes", "on")
+                elif isinstance(current_value, int):
+                    value = int(float(text))
+                elif isinstance(current_value, float):
+                    value = float(text)
+                else:
+                    value = text
+            old = self.detector.get_parameter(key)
+            if value != old:
+                self.detector.set_parameter(key, value)
+                self._log(f"{key}: {old} → {value}")
+        except Exception as exc:
+            self._log(f"✗ {key}: {exc}")
+
     def _apply_parameters(self) -> None:
+        changed = []
         for key, widget in self.controls.items():
             if key in self.READ_ONLY_PARAMS:
                 continue
@@ -414,12 +450,20 @@ class QtOrcaFireDetectorGui(QtWidgets.QMainWindow):
                         value = float(text)
                     else:
                         value = text
-                self.detector.set_parameter(key, value)
+                old = self.detector.get_parameter(key)
+                if value != old:
+                    self.detector.set_parameter(key, value)
+                    changed.append(f"{key}: {old} → {value}")
             except Exception as exc:
                 QtWidgets.QMessageBox.warning(self, "Invalid parameter", f"{key}: {exc}")
                 self._log(f"✗ {key}: {exc}")
                 return
-        self._log("Parameters applied successfully")
+        if changed:
+            for c in changed:
+                self._log(f"  {c}")
+            self._log(f"Applied {len(changed)} parameter(s)")
+        else:
+            self._log("No parameters changed")
         self.statusBar().showMessage("Parameters applied", 3000)
 
     def _single_frame(self) -> None:

@@ -1,3 +1,4 @@
+import logging
 import os
 import threading
 import time
@@ -5,6 +6,8 @@ from pathlib import Path
 from typing import Callable, Dict, Generator, List, Optional
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 class OrcaFireAcquirer:
@@ -91,8 +94,26 @@ class OrcaFireAcquirer:
                 f"Found {len(self._harvester.device_info_list)} devices."
             )
 
-        self._image_acquirer = self._harvester.create_image_acquirer(self._device_index)
+        self._image_acquirer = self._harvester.create(self._device_index)
         self._device_info = self._harvester.device_info_list[self._device_index]
+
+        # Configure data stream to match the camera's actual dimensions.
+        # The frame grabber may not auto-detect these when CXP link is in
+        # "Detected" (vs "Connected") state.
+        try:
+            nm = self._image_acquirer.remote_device.node_map
+            ds = self._image_acquirer.data_streams[0]
+            dsnm = ds.node_map
+            dsnm.ImageFormatSource.value = 'DataStream'
+            dsnm.ImageFormatSelector.value = 'DataStream'
+            dsnm.RemoteWidth.value = nm.Width.value
+            dsnm.RemoteHeight.value = nm.Height.value
+            dsnm.RemotePixelFormat.value = str(nm.PixelFormat.value)
+            logger.info("Stream configured: %dx%d %s",
+                        dsnm.Width.value, dsnm.Height.value,
+                        dsnm.PixelFormat.value)
+        except Exception as exc:
+            logger.warning("Could not configure data stream: %s", exc)
 
     def close(self) -> None:
         """Close the camera and release resources."""
@@ -115,6 +136,24 @@ class OrcaFireAcquirer:
         node_map = self._image_acquirer.remote_device.node_map
         for node_name, value in config.items():
             self._set_node_value(node_map, node_name, value)
+
+    def configure_stream(self, config: Dict[str, object]) -> None:
+        """Configure frame grabber data stream parameters.
+
+        Supported keys:
+            BinningMethod: 'Disable', 'Sum_2x2', 'Mean_2x2', 'Sum_4x4', 'Mean_4x4'
+        """
+        if self._image_acquirer is None:
+            raise RuntimeError("Camera is not open.")
+        ds = self._image_acquirer.data_streams[0]
+        dsnm = ds.node_map
+        for name, value in config.items():
+            try:
+                node = getattr(dsnm, name)
+                node.value = value
+                logger.info("Stream %s = %s", name, value)
+            except Exception as exc:
+                logger.warning("Failed to set stream %s: %s", name, exc)
 
     def _set_node_value(self, node_map, name: str, value: float) -> None:
         if not hasattr(node_map, name):
@@ -141,7 +180,7 @@ class OrcaFireAcquirer:
         if self._is_acquiring:
             return
 
-        self._image_acquirer.start_acquisition()
+        self._image_acquirer.start()
         self._is_acquiring = True
 
     def register_frame_callback(self, callback: Callable[[np.ndarray, Dict], None]) -> None:
@@ -188,7 +227,7 @@ class OrcaFireAcquirer:
         """Stop acquisition and release any pending buffers."""
         if self._image_acquirer is None or not self._is_acquiring:
             return
-        self._image_acquirer.stop_acquisition()
+        self._image_acquirer.stop()
         self._is_acquiring = False
 
     def acquire_frame(self, timeout_ms: int = 1000) -> np.ndarray:
@@ -196,9 +235,9 @@ class OrcaFireAcquirer:
         if self._image_acquirer is None or not self._is_acquiring:
             raise RuntimeError("Acquisition is not running. Call start_acquisition() first.")
 
-        with self._image_acquirer.fetch_buffer(timeout=timeout_ms) as buffer:
+        with self._image_acquirer.fetch(timeout=timeout_ms) as buffer:
             component = buffer.payload.components[0]
-            array = np.asarray(component.data, dtype=np.uint16)
+            array = np.array(component.data, dtype=np.uint16, copy=True)
             height = component.height
             width = component.width
             if array.size != width * height:

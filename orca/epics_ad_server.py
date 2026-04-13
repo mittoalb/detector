@@ -9,6 +9,7 @@ Architecture:
     tomoscan --> [EPICS CA] --> this server --> harvesters --> coaxlink.cti --> ORCA Fire
 """
 
+import asyncio
 import logging
 import os
 import threading
@@ -39,7 +40,7 @@ class CamPlugin(PVGroup):
     # --- Acquisition control ---
     Acquire = pvproperty(value=0, dtype=int)
     AcquireBusy = pvproperty(value=0, dtype=int, read_only=True)
-    ImageMode = pvproperty(value="Multiple", dtype=str)
+    ImageMode = pvproperty(value="Continuous", dtype=ChannelType.STRING)
     NumImages = pvproperty(value=1, dtype=int)
     NumImagesCounter_RBV = pvproperty(value=0, dtype=int, read_only=True)
     ArrayCounter_RBV = pvproperty(value=0, dtype=int, read_only=True)
@@ -57,9 +58,9 @@ class CamPlugin(PVGroup):
     BinY_RBV = pvproperty(value=1, dtype=int, read_only=True)
 
     # --- Image size ---
-    SizeX_RBV = pvproperty(value=4432, dtype=int, read_only=True)
+    SizeX_RBV = pvproperty(value=4480, dtype=int, read_only=True)
     SizeY_RBV = pvproperty(value=2368, dtype=int, read_only=True)
-    MaxSizeX_RBV = pvproperty(value=4432, dtype=int, read_only=True)
+    MaxSizeX_RBV = pvproperty(value=4480, dtype=int, read_only=True)
     MaxSizeY_RBV = pvproperty(value=2368, dtype=int, read_only=True)
 
     # --- Trigger ---
@@ -84,8 +85,8 @@ class CamPlugin(PVGroup):
 
     # --- NDArray output (for live viewing) ---
     ArrayData = pvproperty(value=np.zeros(1, dtype=np.uint16),
-                           dtype=ChannelType.INT, max_length=4432 * 2368)
-    ArraySize0_RBV = pvproperty(value=4432, dtype=int, read_only=True)
+                           dtype=ChannelType.INT, max_length=4480 * 2368)
+    ArraySize0_RBV = pvproperty(value=4480, dtype=int, read_only=True)
     ArraySize1_RBV = pvproperty(value=2368, dtype=int, read_only=True)
     NDimensions_RBV = pvproperty(value=2, dtype=int, read_only=True)
     ColorMode_RBV = pvproperty(value=0, dtype=int, read_only=True)
@@ -99,6 +100,14 @@ class CamPlugin(PVGroup):
         self._frame_counter = 0
         self._frame_callbacks = []
         self._software_trigger_event = threading.Event()
+        self._async_loop = None
+
+    def _publish(self, prop, value):
+        """Thread-safe publish: update value and notify CA monitors."""
+        if self._async_loop is not None:
+            asyncio.run_coroutine_threadsafe(
+                prop.write(value), self._async_loop
+            )
 
     def set_acquirer(self, acquirer):
         """Set the harvesters acquirer instance."""
@@ -118,6 +127,10 @@ class CamPlugin(PVGroup):
         """Register a callback(frame, metadata) for each acquired frame."""
         self._frame_callbacks.append(callback)
 
+    @ArrayCallbacks.startup
+    async def ArrayCallbacks(self, instance, async_lib):
+        self._async_loop = asyncio.get_running_loop()
+
     @Acquire.putter
     async def Acquire(self, instance, value):
         # tomoscan puts 'Acquire' (string) or 1 to start, 0/'Done' to stop
@@ -134,8 +147,7 @@ class CamPlugin(PVGroup):
         value = float(value)
         if self._acquirer:
             try:
-                # Convert seconds to microseconds for camera
-                self._acquirer.configure({"ExposureTime": value * 1e6})
+                self._acquirer.configure({"ExposureTime": value})
             except Exception as exc:
                 logger.warning("Failed to set ExposureTime: %s", exc)
         await self.AcquireTime_RBV.write(value)
@@ -206,13 +218,12 @@ class CamPlugin(PVGroup):
             image_mode = str(self.ImageMode.value)
             num_images = int(self.NumImages.value)
             trigger_mode = str(self.TriggerMode.value)
-            acquire_time = float(self.AcquireTime.value)
 
             # Configure camera
             if self._acquirer:
                 try:
                     self._acquirer.configure({
-                        "ExposureTime": acquire_time * 1e6,
+                        "ExposureTime": float(self.AcquireTime.value),
                     })
                     self._acquirer.start_acquisition()
                 except Exception as exc:
@@ -222,6 +233,11 @@ class CamPlugin(PVGroup):
             self.AcquireBusy._data["value"] = 1
 
             while self._acquiring:
+                # Re-read parameters that can change mid-acquisition
+                image_mode = str(self.ImageMode.value)
+                num_images = int(self.NumImages.value)
+                acquire_time = float(self.AcquireTime.value)
+
                 # Determine how many frames to collect
                 if image_mode == "Single":
                     target = 1
@@ -253,15 +269,15 @@ class CamPlugin(PVGroup):
                     "height": frame.shape[0],
                 }
 
-                # Update PVs
-                self.NumImagesCounter_RBV._data["value"] = self._frame_counter
-                self.ArrayCounter_RBV._data["value"] = self._frame_counter
-                self.ArraySize0_RBV._data["value"] = frame.shape[1]
-                self.ArraySize1_RBV._data["value"] = frame.shape[0]
+                # Update PVs and notify monitors
+                self._publish(self.NumImagesCounter_RBV, self._frame_counter)
+                self._publish(self.ArrayCounter_RBV, self._frame_counter)
+                self._publish(self.ArraySize0_RBV, frame.shape[1])
+                self._publish(self.ArraySize1_RBV, frame.shape[0])
 
                 # Publish frame data for live viewing
                 try:
-                    self.ArrayData._data["value"] = frame.flatten()
+                    self._publish(self.ArrayData, frame.flatten())
                 except Exception:
                     pass
 
@@ -299,7 +315,7 @@ class CamPlugin(PVGroup):
             width = int(self.SizeX_RBV.value)
             height = int(self.SizeY_RBV.value)
             frame = np.random.randint(0, 1000, (height, width), dtype=np.uint16)
-            y, x = np.ogrid[:height, :width]
+            y, x = np.mgrid[:height, :width]
             frame[y % 20 < 10] += 500
             frame[x % 20 < 10] += 500
             return frame
@@ -470,6 +486,46 @@ class HDF5Plugin(PVGroup):
 
 
 # ---------------------------------------------------------------------------
+# PVA NTNDArray server — publishes frames for pystream via PVAccess
+# ---------------------------------------------------------------------------
+
+class NTNDArrayServer:
+    """Publish frames as NTNDArray PVs via pvaccess (pvapy)."""
+
+    def __init__(self, pv_name: str, max_fps: float = 30.0):
+        import pvaccess as pva
+        self._pva = pva
+        self._pv_name = pv_name
+        self._ntnda = pva.NtNdArray()
+        self._server = pva.PvaServer(pv_name, self._ntnda)
+        self._frame_id = 0
+        self._min_interval = 1.0 / max_fps
+        self._last_publish = 0.0
+
+    def publish_frame(self, frame: np.ndarray, metadata: dict):
+        """Frame callback — publish as NTNDArray, throttled."""
+        self._frame_id += 1
+        now = time.time()
+        if now - self._last_publish < self._min_interval:
+            return
+        self._last_publish = now
+
+        ntnda = self._pva.NtNdArray()
+        ntnda.setUniqueId(self._frame_id)
+        ntnda["value"] = {"ushortValue": np.ascontiguousarray(frame.flatten())}
+        height, width = frame.shape[:2]
+        ntnda["dimension"] = [
+            {"size": width, "offset": 0, "fullSize": width,
+             "binning": 1, "reverse": False},
+            {"size": height, "offset": 0, "fullSize": height,
+             "binning": 1, "reverse": False},
+        ]
+        ntnda["uncompressedSize"] = width * height * 2
+        ntnda["compressedSize"] = width * height * 2
+        self._server.update(ntnda)
+
+
+# ---------------------------------------------------------------------------
 # Top-level IOC — wires cam1 + HDF1 together with the harvesters backend
 # ---------------------------------------------------------------------------
 
@@ -513,3 +569,14 @@ class OrcaFireIOC(PVGroup):
         # Wire up cam1 with acquirer and connect HDF1 as frame callback
         self.cam1.set_acquirer(acquirer)
         self.cam1.register_frame_callback(self.HDF1.on_frame)
+
+        # Start PVA NTNDArray server for pystream
+        prefix = self.prefix if hasattr(self, "prefix") else "ORCA:"
+        self._pva_server = None
+        try:
+            self._pva_server = NTNDArrayServer(prefix + "image1:ArrayData")
+            self.cam1.register_frame_callback(self._pva_server.publish_frame)
+            logger.info("PVA NTNDArray server started on %simage1:ArrayData",
+                        prefix)
+        except Exception as exc:
+            logger.warning("PVA server not available: %s", exc)

@@ -38,7 +38,7 @@ class DummyOrcaFireDetector:
         "BitsPerChannel": 16,
 
         # --- Exposure / Acquisition ---
-        "ExposureTime": 10000.0,       # us  (range: 7.309 us – 10 s)
+        "ExposureTime": 0.01,          # s  (range: ~7.3e-6 – 10 s)
         "AcquisitionMode": "Continuous",  # Continuous, SingleFrame, MultiFrame
         "AcquisitionFrameCount": 1,
         "AcquisitionFrameRate": 115.0,  # Hz  (max 115 fps full-res CXP)
