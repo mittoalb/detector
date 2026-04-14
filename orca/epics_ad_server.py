@@ -563,19 +563,27 @@ class OrcaFireIOC(PVGroup):
                  **kwargs):
         super().__init__(*args, **kwargs)
 
-        # Try to connect to real camera
+        # Try to connect to real camera (DCAM first, then GenTL fallback)
         acquirer = None
         try:
-            from orca.harvesters_orca_fire import OrcaFireAcquirer
-            acquirer = OrcaFireAcquirer(
-                gen_tl_producer_path=gen_tl_producer_path,
-                device_index=device_index,
-            )
+            from orca.dcam_acquirer import DCAMAcquirer
+            acquirer = DCAMAcquirer(device_index=device_index)
             acquirer.open()
-            logger.info("Real camera connected")
-        except Exception as exc:
-            logger.warning("No camera available (%s), running in simulation mode", exc)
-            acquirer = None
+            logger.info("Camera connected via DCAM")
+        except Exception as exc_dcam:
+            logger.info("DCAM not available (%s), trying GenTL...", exc_dcam)
+            try:
+                from orca.harvesters_orca_fire import OrcaFireAcquirer
+                acquirer = OrcaFireAcquirer(
+                    gen_tl_producer_path=gen_tl_producer_path,
+                    device_index=device_index,
+                )
+                acquirer.open()
+                logger.info("Camera connected via GenTL")
+            except Exception as exc_gentl:
+                logger.warning("No camera available (%s), simulation mode",
+                               exc_gentl)
+                acquirer = None
 
         # Wire up cam1 with acquirer and connect HDF1 as frame callback
         self.cam1.set_acquirer(acquirer)

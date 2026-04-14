@@ -236,8 +236,8 @@ class QtOrcaFireDetectorGui(QtWidgets.QMainWindow):
         "TimingReadoutTime", "TimingCyclicTriggerPeriod", "InternalFrameRate",
         "SensorCoolerStatus", "SensorTemperature",
         "ImageCounter", "StatusMessage",
-        # Fixed by camera hardware (ORCA Fire C16240-20UP)
-        "Width", "Height", "OffsetX", "OffsetY",
+        # Read-only hardware values
+        "Width", "Height",
         "PixelFormat",
     }
 

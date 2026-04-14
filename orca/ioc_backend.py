@@ -60,7 +60,7 @@ class IOCBackend(DummyOrcaFireDetector):
         # Determine camera connection from IOC
         self._camera_connected = self._cam._acquirer is not None
 
-        # Populate identity from IOC
+        # Populate identity and live values from camera
         if self._camera_connected and self._cam._acquirer is not None:
             try:
                 info = self._cam._acquirer.describe_device()
@@ -68,9 +68,39 @@ class IOCBackend(DummyOrcaFireDetector):
                 self._parameters["DeviceSerialNumber"] = info.get("serial_number", "")
             except Exception:
                 pass
+            # Read live values via DCAM if available
+            if self._is_dcam():
+                self._read_dcam_params()
 
         # Register for frame callbacks from the IOC's acquisition loop
         self._cam.register_frame_callback(self._on_ioc_frame)
+
+    def _read_dcam_params(self):
+        """Read current camera parameters via DCAM and update GUI values."""
+        acq = self._cam._acquirer
+        param_reads = {
+            "ExposureTime": None,
+            "TriggerSource": None,
+            "TriggerActive": None,
+            "TriggerPolarity": None,
+            "BinningHorizontal": None,
+            "SensorTemperature": None,
+            "SensorCoolerStatus": None,
+            "SensorMode": None,
+        }
+        for name in param_reads:
+            try:
+                val = acq.get_param(name)
+                if val is not None:
+                    self._parameters[name] = val
+            except Exception:
+                pass
+        # Sync binning
+        bh = self._parameters.get("BinningHorizontal", 1)
+        if isinstance(bh, float):
+            bh = int(bh)
+            self._parameters["BinningHorizontal"] = bh
+            self._parameters["BinningVertical"] = bh
 
     def start_acquisition(self):
         """Delegate to IOC CamPlugin."""
@@ -106,12 +136,39 @@ class IOCBackend(DummyOrcaFireDetector):
     }
 
     # Full-sensor dimensions
-    _SENSOR_WIDTH = 4480
+    _SENSOR_WIDTH = 4432
     _SENSOR_HEIGHT = 2368
+
+    def _is_dcam(self):
+        """Check if acquirer is DCAM-based."""
+        from orca.dcam_acquirer import DCAMAcquirer
+        return isinstance(self._cam._acquirer, DCAMAcquirer)
 
     def _sync_to_ioc(self, name, value):
         """Push a parameter change to the corresponding IOC PV and camera."""
         acquirer = self._cam._acquirer
+
+        # For DCAM backend, route all known params through set_param
+        if acquirer and self._is_dcam() and name in (
+            "ExposureTime", "TriggerSource", "TriggerActive",
+            "TriggerPolarity", "TriggerDelay", "TriggerTimes",
+            "SensorCooler", "SensorTemperatureTarget", "SensorMode",
+            "ReadoutSpeed", "ReadoutDirection", "ShutterMode",
+        ):
+            try:
+                acquirer.set_param(name, value)
+            except Exception as exc:
+                logger.warning("Failed to set %s: %s", name, exc)
+            # Update corresponding PV
+            pv_map = {
+                "ExposureTime": ("AcquireTime", "AcquireTime_RBV"),
+                "TriggerSource": ("TriggerSource",),
+                "TriggerPolarity": (),
+            }
+            for pv_name in pv_map.get(name, ()):
+                if hasattr(self._cam, pv_name):
+                    getattr(self._cam, pv_name)._data["value"] = value
+            return
 
         if name == "ExposureTime":
             self._cam.AcquireTime._data["value"] = float(value)
@@ -131,37 +188,39 @@ class IOCBackend(DummyOrcaFireDetector):
             with self._lock:
                 self._parameters["BinningHorizontal"] = binval
                 self._parameters["BinningVertical"] = binval
-            method = self._BINNING_MAP.get(binval)
-            if method and acquirer:
+            if acquirer:
                 was_running = self._running
                 if was_running:
                     self.stop_acquisition()
-                acquirer.configure_stream({"BinningMethod": method})
+                if self._is_dcam():
+                    acquirer.set_property(0x00401110, float(binval))
+                else:
+                    method = self._BINNING_MAP.get(binval)
+                    if method:
+                        acquirer.configure_stream({"BinningMethod": method})
                 if was_running:
                     self.start_acquisition()
-            elif binval not in self._BINNING_MAP:
-                logger.warning("Binning %d not supported (use 1, 2, or 4)", binval)
             self._update_frame_size(binval)
         elif name == "TriggerMode":
             self._cam.TriggerMode._data["value"] = str(value)
             self._cam.TriggerMode_RBV._data["value"] = str(value)
             if acquirer:
-                mode = "Off" if str(value) == "Off" else "On"
-                acquirer.set_trigger_mode(mode)
+                acquirer.set_trigger_mode(str(value))
         elif name == "TriggerSource":
             self._cam.TriggerSource._data["value"] = str(value)
             if acquirer:
-                source_map = {
-                    "Internal": None,
-                    "External": "TTLIO11",
-                    "BNC": "TTLIO11",
-                    "Software": "Software",
-                }
-                src = source_map.get(str(value))
-                if src == "Software":
-                    acquirer.set_trigger_mode("Software")
-                elif src:
-                    acquirer.configure_external_trigger(source=src)
+                if self._is_dcam():
+                    acquirer.set_param("TriggerSource", str(value))
+                else:
+                    source_map = {
+                        "Internal": None, "External": "TTLIO11",
+                        "BNC": "TTLIO11", "Software": "Software",
+                    }
+                    src = source_map.get(str(value))
+                    if src == "Software":
+                        acquirer.set_trigger_mode("Software")
+                    elif src:
+                        acquirer.configure_external_trigger(source=src)
         elif name == "TriggerPolarity":
             if acquirer:
                 act = "RisingEdge" if str(value) == "Positive" else "FallingEdge"
