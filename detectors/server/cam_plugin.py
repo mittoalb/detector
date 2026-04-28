@@ -1,0 +1,290 @@
+"""
+Camera plugin (cam1:) — areaDetector-compatible PVs for camera control.
+
+Camera-agnostic: works with any BaseCamera subclass.
+"""
+
+import asyncio
+import logging
+import threading
+import time
+from typing import Optional
+
+import numpy as np
+
+from caproto import ChannelType
+from caproto.server import PVGroup, pvproperty
+
+from detectors.core.base import BaseCamera
+
+logger = logging.getLogger(__name__)
+
+
+class CamPlugin(PVGroup):
+    """areaDetector cam1: PVs.
+
+    Camera-agnostic — uses a BaseCamera instance for actual hardware access.
+    """
+
+    # Identity
+    Manufacturer_RBV = pvproperty(value="", dtype=str, max_length=40, read_only=True)
+    Model_RBV = pvproperty(value="", dtype=str, max_length=40, read_only=True)
+    PortName_RBV = pvproperty(value="CAM1", dtype=str, max_length=40, read_only=True)
+
+    # Acquisition
+    Acquire = pvproperty(value=0, dtype=int)
+    AcquireBusy = pvproperty(value=0, dtype=int, read_only=True)
+    ImageMode = pvproperty(value="Continuous", dtype=str, max_length=40)
+    NumImages = pvproperty(value=1, dtype=int)
+    NumImagesCounter_RBV = pvproperty(value=0, dtype=int, read_only=True)
+    ArrayCounter_RBV = pvproperty(value=0, dtype=int, read_only=True)
+
+    # Exposure
+    AcquireTime = pvproperty(value=0.01, dtype=float, precision=6)
+    AcquireTime_RBV = pvproperty(value=0.01, dtype=float, precision=6, read_only=True)
+    AcquirePeriod = pvproperty(value=0.0, dtype=float, precision=6)
+    AcquirePeriod_RBV = pvproperty(value=0.0, dtype=float, precision=6, read_only=True)
+
+    # Binning
+    BinX = pvproperty(value=1, dtype=int)
+    BinX_RBV = pvproperty(value=1, dtype=int, read_only=True)
+    BinY = pvproperty(value=1, dtype=int)
+    BinY_RBV = pvproperty(value=1, dtype=int, read_only=True)
+
+    # Image size
+    SizeX = pvproperty(value=4432, dtype=int)
+    SizeX_RBV = pvproperty(value=4432, dtype=int, read_only=True)
+    SizeY = pvproperty(value=2368, dtype=int)
+    SizeY_RBV = pvproperty(value=2368, dtype=int, read_only=True)
+    MaxSizeX_RBV = pvproperty(value=4432, dtype=int, read_only=True)
+    MaxSizeY_RBV = pvproperty(value=2368, dtype=int, read_only=True)
+    MinX = pvproperty(value=0, dtype=int)
+    MinY = pvproperty(value=0, dtype=int)
+
+    # Trigger
+    TriggerMode = pvproperty(value="Off", dtype=str, max_length=40)
+    TriggerMode_RBV = pvproperty(value="Off", dtype=str, max_length=40, read_only=True)
+    TriggerSource = pvproperty(value="Internal", dtype=str, max_length=40)
+    TriggerSoftware = pvproperty(value=0, dtype=int)
+    TriggerOverlap = pvproperty(value="Off", dtype=str, max_length=40)
+    ExposureMode = pvproperty(value="Timed", dtype=str, max_length=40)
+    FrameRateEnable = pvproperty(value=0, dtype=int)
+
+    # Pixel format
+    PixelFormat = pvproperty(value="Mono16", dtype=str, max_length=40)
+    PixelFormat_RBV = pvproperty(value="Mono16", dtype=str, max_length=40, read_only=True)
+
+    # Sensor
+    SensorTemperature_RBV = pvproperty(value=0.0, dtype=float, read_only=True)
+
+    # Plugin support
+    WaitForPlugins = pvproperty(value="No", dtype=str, max_length=40)
+    NDAttributesFile = pvproperty(value="", dtype=str, max_length=256)
+    NDAttributesMacros = pvproperty(value="", dtype=str, max_length=256)
+    UniqueIdMode = pvproperty(value=0, dtype=int)
+    ArrayCallbacks = pvproperty(value="Enable", dtype=str, max_length=40)
+
+    # NDArray output
+    ArrayData = pvproperty(value=np.zeros(1, dtype=np.uint16),
+                           dtype=ChannelType.INT, max_length=4480 * 2368)
+    ArraySize0_RBV = pvproperty(value=4432, dtype=int, read_only=True)
+    ArraySize1_RBV = pvproperty(value=2368, dtype=int, read_only=True)
+    NDimensions_RBV = pvproperty(value=2, dtype=int, read_only=True)
+    ColorMode_RBV = pvproperty(value=0, dtype=int, read_only=True)
+    DataType_RBV = pvproperty(value="UInt16", dtype=str, max_length=40, read_only=True)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._camera: Optional[BaseCamera] = None
+        self._acquiring = False
+        self._acq_thread = None
+        self._frame_counter = 0
+        self._frame_callbacks = []
+        self._software_trigger_event = threading.Event()
+        self._async_loop = None
+
+    def set_camera(self, camera: Optional[BaseCamera]) -> None:
+        """Bind a BaseCamera to this plugin."""
+        self._camera = camera
+        if camera is None:
+            return
+        info = camera.get_info()
+        self.Manufacturer_RBV._data["value"] = info.vendor
+        self.Model_RBV._data["value"] = info.model
+        self.SizeX_RBV._data["value"] = info.sensor_width
+        self.SizeY_RBV._data["value"] = info.sensor_height
+        self.MaxSizeX_RBV._data["value"] = info.sensor_width
+        self.MaxSizeY_RBV._data["value"] = info.sensor_height
+        self.ArraySize0_RBV._data["value"] = info.sensor_width
+        self.ArraySize1_RBV._data["value"] = info.sensor_height
+        # Read live ExposureTime
+        try:
+            exp = camera.get_param("ExposureTime")
+            self.AcquireTime._data["value"] = float(exp)
+            self.AcquireTime_RBV._data["value"] = float(exp)
+        except Exception:
+            pass
+        logger.info("CamPlugin bound to %s %s (%dx%d)",
+                    info.vendor, info.model,
+                    info.sensor_width, info.sensor_height)
+
+    def register_frame_callback(self, callback) -> None:
+        self._frame_callbacks.append(callback)
+
+    def _publish(self, prop, value):
+        """Thread-safe PV update with monitor notification."""
+        if self._async_loop is not None:
+            asyncio.run_coroutine_threadsafe(prop.write(value), self._async_loop)
+
+    @ArrayCallbacks.startup
+    async def ArrayCallbacks(self, instance, async_lib):
+        self._async_loop = asyncio.get_running_loop()
+
+    @Acquire.putter
+    async def Acquire(self, instance, value):
+        if value in (1, "Acquire") and not self._acquiring:
+            self._start_acquisition()
+            return 1
+        elif value in (0, "Done") or (value not in (1, "Acquire") and self._acquiring):
+            self._stop_acquisition()
+            return 0
+        return value
+
+    @AcquireTime.putter
+    async def AcquireTime(self, instance, value):
+        v = float(value)
+        if self._camera:
+            try:
+                self._camera.set_param("ExposureTime", v)
+            except Exception as exc:
+                logger.warning("Failed to set ExposureTime: %s", exc)
+        await self.AcquireTime_RBV.write(v)
+        return v
+
+    @TriggerMode.putter
+    async def TriggerMode(self, instance, value):
+        v = str(value)
+        if self._camera:
+            try:
+                self._camera.set_param("TriggerMode", v)
+            except Exception as exc:
+                logger.warning("Failed to set TriggerMode: %s", exc)
+        await self.TriggerMode_RBV.write(v)
+        return v
+
+    @TriggerSoftware.putter
+    async def TriggerSoftware(self, instance, value):
+        if value == 1:
+            self._software_trigger_event.set()
+            if self._camera:
+                try:
+                    self._camera.software_trigger()
+                except Exception:
+                    pass
+        return value
+
+    @BinX.putter
+    async def BinX(self, instance, value):
+        v = int(value)
+        if self._camera:
+            try:
+                self._camera.set_param("BinningHorizontal", v)
+                self._camera.set_param("BinningVertical", v)
+            except Exception as exc:
+                logger.warning("Failed to set Binning: %s", exc)
+        await self.BinX_RBV.write(v)
+        await self.BinY_RBV.write(v)
+        return v
+
+    def _start_acquisition(self):
+        if self._acq_thread is not None and self._acq_thread.is_alive():
+            return
+        self._acquiring = True
+        self._frame_counter = 0
+        self._acq_thread = threading.Thread(
+            target=self._acquisition_loop, daemon=True)
+        self._acq_thread.start()
+
+    def _stop_acquisition(self):
+        self._acquiring = False
+        self._software_trigger_event.set()
+        if self._acq_thread is not None:
+            self._acq_thread.join(timeout=3.0)
+            self._acq_thread = None
+
+    def _acquisition_loop(self):
+        try:
+            if self._camera:
+                try:
+                    self._camera.set_param("ExposureTime",
+                                           float(self.AcquireTime.value))
+                    self._camera.start_acquisition()
+                except Exception as exc:
+                    logger.error("Failed to start acquisition: %s", exc)
+                    self._camera = None
+
+            self._publish(self.AcquireBusy, 1)
+
+            while self._acquiring:
+                image_mode = str(self.ImageMode.value)
+                num_images = int(self.NumImages.value)
+
+                if image_mode == "Single":
+                    target = 1
+                elif image_mode == "Multiple":
+                    target = num_images
+                else:
+                    target = 0
+
+                if target > 0 and self._frame_counter >= target:
+                    break
+
+                if self._camera:
+                    try:
+                        frame = self._camera.acquire_frame(timeout_ms=5000)
+                    except Exception as exc:
+                        logger.warning("Frame acquisition failed: %s", exc)
+                        continue
+                else:
+                    # Simulation fallback
+                    time.sleep(float(self.AcquireTime.value))
+                    w = int(self.SizeX_RBV.value)
+                    h = int(self.SizeY_RBV.value)
+                    frame = np.random.randint(0, 1000, (h, w), dtype=np.uint16)
+
+                if frame is None:
+                    continue
+
+                self._frame_counter += 1
+                metadata = {
+                    "timestamp": time.time(),
+                    "frame_number": self._frame_counter,
+                    "width": frame.shape[1],
+                    "height": frame.shape[0],
+                }
+
+                self._publish(self.NumImagesCounter_RBV, self._frame_counter)
+                self._publish(self.ArrayCounter_RBV, self._frame_counter)
+                self._publish(self.ArraySize0_RBV, frame.shape[1])
+                self._publish(self.ArraySize1_RBV, frame.shape[0])
+                try:
+                    self._publish(self.ArrayData, frame.flatten())
+                except Exception:
+                    pass
+
+                for cb in self._frame_callbacks:
+                    try:
+                        cb(frame, metadata)
+                    except Exception as exc:
+                        logger.error("Frame callback error: %s", exc)
+
+        finally:
+            if self._camera:
+                try:
+                    self._camera.stop_acquisition()
+                except Exception:
+                    pass
+            self._acquiring = False
+            self._publish(self.AcquireBusy, 0)
+            self._publish(self.Acquire, 0)
+            logger.info("Acquisition stopped after %d frames", self._frame_counter)
