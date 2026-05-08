@@ -6,11 +6,32 @@ Writes acquired frames to HDF5 files at /exchange/data dataset.
 
 import logging
 import os
+import queue
 import threading
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
+
+
+def _free_ram_bytes() -> int:
+    """Return free system memory in bytes (Linux). Returns 0 if unknown."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    return 0
+
+
+def _compute_queue_size(frame_bytes: int, budget_frac: float = 0.25) -> int:
+    """How many frames fit in budget_frac * available RAM."""
+    free = _free_ram_bytes()
+    if free <= 0 or frame_bytes <= 0:
+        return 100  # safe default
+    return max(8, int(free * budget_frac / frame_bytes))
 
 from caproto.server import PVGroup, pvproperty
 
@@ -45,11 +66,21 @@ class HDF5Plugin(PVGroup):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._lock = threading.Lock()
+        # Reentrant lock: on_frame may call _stop_capture while holding it
+        self._lock = threading.RLock()
         self._capturing = False
         self._h5_file = None
         self._h5_dataset = None
         self._frames_captured = 0
+        # Flush every N frames (set to ~1s worth at expected fps)
+        self._flush_every = 100
+        # Background HDF5 writer: queue + thread keep acquisition non-blocking
+        self._write_queue: Optional[queue.Queue] = None
+        self._write_thread: Optional[threading.Thread] = None
+        # Queue size is computed from available RAM at capture-start time.
+        # Use up to RAM_BUDGET_FRAC of free system memory.
+        self._ram_budget_frac = 0.25
+        self._dropped_frames = 0
 
     @FilePath.putter
     async def FilePath(self, instance, value):
@@ -75,31 +106,94 @@ class HDF5Plugin(PVGroup):
         return value
 
     def on_frame(self, frame: np.ndarray, metadata: dict) -> None:
-        """Frame callback — write frame to HDF5 if capturing."""
+        """Frame callback — non-blocking enqueue to background writer."""
         if not self._capturing:
             return
-        with self._lock:
-            if self._h5_file is None:
-                return
+
+        # Size the queue based on available RAM and the actual frame bytes.
+        # We can only do this once we know the frame size, so deferred to
+        # the first frame.
+        if self._write_queue is None:
+            frame_bytes = int(frame.nbytes)
+            qsize = _compute_queue_size(frame_bytes, self._ram_budget_frac)
+            self._write_queue = queue.Queue(maxsize=qsize)
+            free_mb = _free_ram_bytes() / 1e6
+            logger.info(
+                "HDF5 queue: %d frames (%.0f MB / frame, %.0f MB free RAM)",
+                qsize, frame_bytes / 1e6, free_mb)
+            # Start writer thread now (couldn't earlier — queue didn't exist)
+            self._write_thread = threading.Thread(
+                target=self._writer_loop, daemon=True, name="hdf5-writer")
+            self._write_thread.start()
+
+        # Make a contiguous copy now: the underlying buffer may be reused
+        # by the camera before the writer thread gets to it.
+        try:
+            self._write_queue.put_nowait(np.ascontiguousarray(frame))
+        except queue.Full:
+            # Writer can't keep up — drop this frame
+            self._dropped_frames += 1
+            if self._dropped_frames % 50 == 1:
+                logger.warning("HDF5 writer behind, dropped %d frames so far",
+                               self._dropped_frames)
+
+    def _writer_loop(self):
+        """Background thread: drain queue and write to HDF5."""
+        while True:
             try:
-                idx = self._frames_captured
-                num_capture = int(self.NumCapture.value)
+                item = self._write_queue.get(timeout=0.5)
+            except queue.Empty:
+                if not self._capturing:
+                    return
+                continue
+            if item is None:
+                # Sentinel — flush and exit
+                return
 
-                # Resize dataset if needed
-                if idx >= self._h5_dataset.shape[0]:
-                    new_size = max(idx + 1, num_capture)
-                    self._h5_dataset.resize((new_size, frame.shape[0],
-                                             frame.shape[1]))
+            with self._lock:
+                if self._h5_file is None:
+                    continue
+                try:
+                    num_capture = int(self.NumCapture.value)
+                    frame = item
 
-                self._h5_dataset[idx] = frame
-                self._h5_file.flush()
-                self._frames_captured += 1
-                self.NumCaptured_RBV._data["value"] = self._frames_captured
+                    # Lazily create dataset from first frame's actual shape
+                    if self._h5_dataset is None:
+                        h, w = frame.shape[0], frame.shape[1]
+                        self._h5_dataset = self._h5_file.create_dataset(
+                            "/exchange/data",
+                            shape=(max(num_capture, 1), h, w),
+                            maxshape=(None, h, w),
+                            dtype=frame.dtype,
+                            chunks=(1, h, w),
+                        )
 
-                if num_capture > 0 and self._frames_captured >= num_capture:
-                    self._stop_capture()
-            except Exception as exc:
-                logger.error("HDF5 write error: %s", exc)
+                    idx = self._frames_captured
+
+                    if idx >= self._h5_dataset.shape[0]:
+                        new_size = max(idx + 1, num_capture)
+                        self._h5_dataset.resize((new_size,) +
+                                                self._h5_dataset.shape[1:])
+
+                    if frame.shape != self._h5_dataset.shape[1:]:
+                        logger.warning(
+                            "HDF5: frame shape %s != dataset %s, skipping",
+                            frame.shape, self._h5_dataset.shape[1:])
+                        continue
+
+                    self._h5_dataset[idx] = frame
+                    self._frames_captured += 1
+                    if self._frames_captured % self._flush_every == 0:
+                        self._h5_file.flush()
+                    self.NumCaptured_RBV._data["value"] = self._frames_captured
+
+                    if num_capture > 0 and self._frames_captured >= num_capture:
+                        # Don't recurse via _stop_capture (it joins this thread).
+                        # Just signal the cam_plugin via end_callback path.
+                        self._capturing = False
+                        return
+                except Exception as exc:
+                    logger.error("HDF5 write error: %s", exc)
 
     def _start_capture(self):
         try:
@@ -125,25 +219,15 @@ class HDF5Plugin(PVGroup):
                 logger.error("Cannot create dir %s: %s", file_path, exc)
                 return
 
-            num_capture = max(1, int(self.NumCapture.value))
             try:
-                self._h5_file = h5py.File(full_name, "w")
-                # Create dataset with first frame's expected shape
-                # We don't know the shape yet — use sensor dims if available
-                cam = self.parent.cam1 if hasattr(self.parent, 'cam1') else None
-                if cam:
-                    h = int(cam.SizeY_RBV.value)
-                    w = int(cam.SizeX_RBV.value)
-                else:
-                    h, w = 2368, 4432
-                self._h5_dataset = self._h5_file.create_dataset(
-                    "/exchange/data",
-                    shape=(num_capture, h, w),
-                    maxshape=(None, h, w),
-                    dtype=np.uint16,
-                    chunks=(1, h, w),
-                )
+                self._h5_file = h5py.File(full_name, "w", libver="latest")
+                # Dataset, queue, and writer thread are created lazily on
+                # the first frame (we need the frame size to budget RAM).
+                self._h5_dataset = None
+                self._write_queue = None
+                self._write_thread = None
                 self._frames_captured = 0
+                self._dropped_frames = 0
                 self._capturing = True
                 self.Capture_RBV._data["value"] = 1
                 self.WriteStatus._data["value"] = "Capturing"
@@ -154,11 +238,27 @@ class HDF5Plugin(PVGroup):
                 logger.error("Failed to open HDF5 file: %s", exc)
                 self._h5_file = None
                 self._h5_dataset = None
+                self._write_queue = None
 
     def _stop_capture(self):
         self._capturing = False
         self.Capture_RBV._data["value"] = 0
         self.WriteStatus._data["value"] = "Idle"
+
+        # Drain queue and stop writer thread first (outside the lock,
+        # since writer needs the lock to drain remaining items)
+        if self._write_queue is not None:
+            try:
+                self._write_queue.put_nowait(None)  # sentinel
+            except queue.Full:
+                pass
+        if self._write_thread is not None:
+            current = threading.current_thread()
+            if self._write_thread is not current:
+                self._write_thread.join(timeout=10.0)
+            self._write_thread = None
+        self._write_queue = None
+
         with self._lock:
             if self._h5_file is not None:
                 try:
@@ -168,7 +268,10 @@ class HDF5Plugin(PVGroup):
                         self._h5_dataset.resize(
                             (self._frames_captured,) + self._h5_dataset.shape[1:])
                     self._h5_file.close()
-                    logger.info("HDF5: closed (%d frames)", self._frames_captured)
+                    msg = f"HDF5: closed ({self._frames_captured} frames)"
+                    if self._dropped_frames:
+                        msg += f", {self._dropped_frames} dropped"
+                    logger.info(msg)
                 except Exception as exc:
                     logger.error("HDF5 close error: %s", exc)
                 finally:

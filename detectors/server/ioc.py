@@ -42,6 +42,8 @@ class DetectorIOC(PVGroup):
         self.camera = camera
         self.cam1.set_camera(camera)
         self.cam1.register_frame_callback(self.HDF1.on_frame)
+        # Stop HDF5 capture when acquisition ends (avoids leaving file locked)
+        self.cam1.register_end_callback(self.HDF1._stop_capture)
 
         # PVA NTNDArray server
         prefix = self.prefix if hasattr(self, "prefix") else ""

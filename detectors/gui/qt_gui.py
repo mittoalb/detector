@@ -1,177 +1,424 @@
 """
-Camera-agnostic Qt GUI.
+Camera-agnostic Qt GUI with tabs and dark theme.
 
-Builds parameter controls dynamically from the camera's `list_params()` so
-any BaseCamera backend works without GUI changes.
+Builds parameter controls dynamically from the camera's `list_params()`,
+arranged into logical tabs. Works with any BaseCamera backend.
 """
 
 import logging
-from typing import Any, Dict
-
-import numpy as np
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from PyQt5 import QtCore, QtWidgets
+    from PyQt5.QtCore import pyqtSignal as Signal
 except ImportError:
     from PySide6 import QtCore, QtWidgets
+    from PySide6.QtCore import Signal
+
+from detectors.core.base import BaseCamera
 
 logger = logging.getLogger(__name__)
 
 
-# Hint the GUI which params should use a combo vs free-form text edit
-ENUM_CHOICES = {
-    "TriggerMode": ["Off", "On"],
-    "TriggerSource": ["Internal", "External", "Software"],
-    "TriggerActive": ["Edge", "Level", "SyncReadout"],
-    "TriggerPolarity": ["Positive", "Negative"],
+# Logical tab groupings. Parameters not appearing in any group go into "Other".
+PARAM_TABS: List[Tuple[str, List[Tuple[str, str]]]] = [
+    ("Exposure & Acquisition", [
+        ("ExposureTime", "Exposure Time (s)"),
+        ("AcquisitionFrameRate", "Frame Rate (Hz)"),
+        ("AcquisitionFrameCount", "Frame Count"),
+        ("AcquisitionMode", "Acquisition Mode"),
+    ]),
+    ("Image Format & ROI", [
+        ("Width", "Width (px)"),
+        ("Height", "Height (px)"),
+        ("OffsetX", "X Offset (px)"),
+        ("OffsetY", "Y Offset (px)"),
+        ("BinningHorizontal", "Binning H"),
+        ("BinningVertical", "Binning V"),
+        ("SubarrayMode", "Subarray Mode"),
+        ("SubarrayHPos", "Subarray H Pos"),
+        ("SubarrayHSize", "Subarray H Size"),
+        ("SubarrayVPos", "Subarray V Pos"),
+        ("SubarrayVSize", "Subarray V Size"),
+        ("PixelFormat", "Pixel Format"),
+        ("ReverseX", "Reverse X"),
+        ("ReverseY", "Reverse Y"),
+    ]),
+    ("Readout & Sensor", [
+        ("SensorMode", "Sensor Mode"),
+        ("ReadoutSpeed", "Readout Speed"),
+        ("ReadoutDirection", "Readout Direction"),
+        ("ShutterMode", "Shutter Mode"),
+    ]),
+    ("Trigger Input", [
+        ("TriggerMode", "Trigger Mode"),
+        ("TriggerSource", "Trigger Source"),
+        ("TriggerActive", "Trigger Active"),
+        ("TriggerPolarity", "Trigger Polarity"),
+        ("TriggerConnector", "Trigger Connector"),
+        ("TriggerDelay", "Trigger Delay (s)"),
+        ("TriggerTimes", "Trigger Count"),
+    ]),
+    ("Cooling", [
+        ("SensorTemperature", "Temperature (°C)"),
+        ("SensorCooler", "Cooler"),
+        ("SensorTemperatureTarget", "Target Temp (°C)"),
+        ("SensorCoolerStatus", "Cooler Status"),
+    ]),
+    ("Output Trigger", [
+        ("OutputTriggerKind", "Output Kind"),
+        ("OutputTriggerPolarity", "Output Polarity"),
+        ("OutputTriggerActive", "Output Active"),
+        ("OutputTriggerDelay", "Output Delay (s)"),
+        ("OutputTriggerPeriod", "Output Period (s)"),
+    ]),
+]
+
+# Enum value choices for combo boxes
+ENUM_CHOICES: Dict[str, list] = {
+    "AcquisitionMode": ["Continuous", "SingleFrame", "MultiFrame"],
+    "PixelFormat": ["Mono8", "Mono12", "Mono16"],
+    "SubarrayMode": ["OFF", "ON"],
+    "SensorMode": ["Area", "Lightsheet", "SplitView", "DualLightsheet"],
+    "ReadoutSpeed": ["Slowest", "Fastest", "Fast"],
+    "ReadoutDirection": ["Forward", "Backward", "Bidirectional", "Reverse"],
     "ShutterMode": ["Rolling", "Global"],
-    "SensorMode": ["Area", "Lightsheet", "SplitView"],
-    "ReadoutSpeed": ["Fastest", "Slowest"],
+    "TriggerMode": ["Off", "On"],
+    "TriggerSource": ["Internal", "External", "Software", "MasterPulse"],
+    "TriggerActive": ["Edge", "Level", "SyncReadout", "Point"],
+    "TriggerPolarity": ["Positive", "Negative"],
+    "TriggerConnector": ["Interface", "BNC"],
+    "OutputTriggerKind": ["ExposureTiming", "ReadoutEnd", "TriggerReady",
+                           "AnyRowExposureTiming", "Programmable", "High", "Low"],
+    "OutputTriggerPolarity": ["Positive", "Negative"],
+    "OutputTriggerActive": ["Edge", "Level"],
     "SensorCooler": ["Off", "On", "Max"],
     "BinningHorizontal": [1, 2, 4],
     "BinningVertical": [1, 2, 4],
-    "PixelFormat": ["Mono8", "Mono12", "Mono16"],
+    "ReverseX": [False, True],
+    "ReverseY": [False, True],
 }
 
-# Params that should never be editable in the GUI
+# Parameters that should never be editable in the GUI
 READ_ONLY_PARAMS = {
-    "Width", "Height", "PixelFormat", "SensorTemperature",
-    "SensorCoolerStatus", "AcquisitionFrameRate",
+    "Width", "Height", "PixelFormat",
+    "SensorTemperature", "SensorCoolerStatus",
+    "AcquisitionFrameRate", "InternalFrameRate",
+    "TimingReadoutTime", "TimingCyclicTriggerPeriod",
 }
+
+DARK_STYLESHEET = """
+    QMainWindow, QWidget, QDialog { background-color: #202124; color: #f1f3f4; }
+    QLineEdit { background-color: #212325; color: #f1f3f4; border: 1px solid #3c4043; padding: 4px; }
+    QComboBox { background-color: #212325; color: #f1f3f4; border: 1px solid #3c4043; padding: 4px; }
+    QComboBox::drop-down { border: none; }
+    QComboBox::down-arrow { image: none; border-left: 4px solid transparent; border-right: 4px solid transparent; border-top: 6px solid #9aa0a6; margin-right: 6px; }
+    QComboBox QAbstractItemView { background-color: #2a2d32; color: #f1f3f4; selection-background-color: #3c4043; border: 1px solid #5f6368; }
+    QPushButton { background-color: #3c4043; color: #f1f3f4; border: 1px solid #5f6368; padding: 6px 12px; border-radius: 3px; }
+    QPushButton:hover { background-color: #5f6368; }
+    QPushButton:pressed { background-color: #3c4043; }
+    QLabel { color: #f1f3f4; }
+    QGroupBox { color: #8ab4f8; border: 1px solid #3c4043; border-radius: 4px; padding-top: 8px; margin-top: 6px; }
+    QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 3px; }
+    QTabWidget, QTabBar { background-color: #202124; color: #f1f3f4; }
+    QTabWidget::pane { border: 1px solid #3c4043; }
+    QTabBar::tab { background-color: #2a2d32; color: #f1f3f4; padding: 6px 12px; }
+    QTabBar::tab:selected { background-color: #3c4043; }
+    QPlainTextEdit { background-color: #111315; color: #e8eaed; border: 1px solid #3c4043; }
+    QScrollArea { border: none; background-color: #202124; }
+    QScrollBar { background-color: #2a2d32; }
+    QScrollBar:vertical { width: 12px; }
+    QScrollBar::handle { background-color: #5f6368; border-radius: 6px; }
+    QScrollBar::handle:hover { background-color: #9aa0a6; }
+"""
 
 
 class DetectorGui(QtWidgets.QMainWindow):
-    """Generic camera control window."""
+    """Camera-agnostic detector control GUI with tabs and dark theme."""
+
+    parameter_changed = Signal(str, object)
+    frame_ready = Signal(object, dict)
 
     def __init__(self, ioc, parent=None):
         super().__init__(parent)
         self.ioc = ioc
-        self.camera = ioc.camera
+        self.camera: Optional[BaseCamera] = ioc.camera
         info = self.camera.get_info() if self.camera else None
 
-        self.setWindowTitle(
-            f"Detector: {info.vendor} {info.model}" if info else "Detector")
-        self.resize(900, 700)
+        title = (f"{info.vendor} {info.model}"
+                 if info else "Detector Control")
+        self.setWindowTitle(f"Detector Control — {title}")
+        self.resize(1200, 720)
+        self.setStyleSheet(DARK_STYLESHEET)
 
-        self.controls: Dict[str, QtWidgets.QWidget] = {}
+        self.controls: Dict[str, Any] = {}
+        self.status_labels: Dict[str, QtWidgets.QLabel] = {}
+        self.last_frame = None
+
+        # Measured fps state
+        self._fps_count = 0
+        self._fps_last_t = 0.0
+        self._measured_fps = 0.0
+
         self._build_ui()
         self._populate_values()
 
-        # Refresh values periodically (for SensorTemperature etc.)
+        # Refresh read-only values periodically (e.g. SensorTemperature)
         self._refresh_timer = QtCore.QTimer(self)
         self._refresh_timer.timeout.connect(self._refresh_readonly)
         self._refresh_timer.start(1000)
 
+        # Wire frame callback to update status
+        self.ioc.cam1.register_frame_callback(self._on_frame)
+
+    # ---------- UI construction ----------
+
     def _build_ui(self):
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
-        layout = QtWidgets.QHBoxLayout(central)
+        layout = QtWidgets.QVBoxLayout(central)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
 
-        # Left: parameters
-        left = QtWidgets.QWidget()
-        left_layout = QtWidgets.QVBoxLayout(left)
+        # Toolbar
+        toolbar = QtWidgets.QHBoxLayout()
+        layout.addLayout(toolbar)
 
-        info_box = QtWidgets.QGroupBox("Camera")
-        info_layout = QtWidgets.QFormLayout(info_box)
-        if self.camera:
-            info = self.camera.get_info()
-            info_layout.addRow("Vendor:", QtWidgets.QLabel(info.vendor))
-            info_layout.addRow("Model:", QtWidgets.QLabel(info.model))
-            if info.serial_number:
-                info_layout.addRow("Serial:", QtWidgets.QLabel(info.serial_number))
-            info_layout.addRow("Sensor:",
-                               QtWidgets.QLabel(f"{info.sensor_width} x {info.sensor_height}"))
-        left_layout.addWidget(info_box)
+        title = QtWidgets.QLabel("Detector Control")
+        title.setStyleSheet("font-size: 14pt; font-weight: bold;")
+        toolbar.addWidget(title)
+        toolbar.addStretch(1)
 
-        params_box = QtWidgets.QGroupBox("Parameters")
-        params_form = QtWidgets.QFormLayout(params_box)
-        params_form.setLabelAlignment(QtCore.Qt.AlignRight)
+        self.start_btn = QtWidgets.QPushButton("Start")
+        self.stop_btn = QtWidgets.QPushButton("Stop")
+        self.apply_btn = QtWidgets.QPushButton("Apply Changes")
+        self.single_btn = QtWidgets.QPushButton("Single Frame")
+        self.trigger_btn = QtWidgets.QPushButton("Software Trigger")
+        for btn in [self.start_btn, self.stop_btn, self.apply_btn,
+                    self.single_btn, self.trigger_btn]:
+            btn.setMinimumWidth(120)
+            toolbar.addWidget(btn)
+        self.start_btn.clicked.connect(self._start_acquisition)
+        self.stop_btn.clicked.connect(self._stop_acquisition)
+        self.apply_btn.clicked.connect(self._apply_all)
+        self.single_btn.clicked.connect(self._single_frame)
+        self.trigger_btn.clicked.connect(self._software_trigger)
 
-        if self.camera:
-            for name in self.camera.list_params():
-                widget = self._make_widget(name)
-                if widget:
-                    self.controls[name] = widget
-                    params_form.addRow(name + ":", widget)
+        # Body: tabs on left, status panel on right
+        body = QtWidgets.QHBoxLayout()
+        layout.addLayout(body, 1)
 
-        scroll = QtWidgets.QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(params_box)
-        left_layout.addWidget(scroll, 1)
+        # Left: parameter tabs
+        self.param_tabs = QtWidgets.QTabWidget()
+        body.addWidget(self.param_tabs, 2)
+        self._create_tabs()
 
-        layout.addWidget(left, 2)
-
-        # Right: actions and PVA info
+        # Right: status, actions, log
         right = QtWidgets.QWidget()
         right_layout = QtWidgets.QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(10)
+        body.addWidget(right, 1)
 
-        actions_box = QtWidgets.QGroupBox("Actions")
-        actions_layout = QtWidgets.QVBoxLayout(actions_box)
-        self.start_btn = QtWidgets.QPushButton("Start Acquisition")
-        self.stop_btn = QtWidgets.QPushButton("Stop Acquisition")
-        self.trigger_btn = QtWidgets.QPushButton("Software Trigger")
-        self.start_btn.clicked.connect(self._start)
-        self.stop_btn.clicked.connect(self._stop)
-        self.trigger_btn.clicked.connect(self._trigger)
-        actions_layout.addWidget(self.start_btn)
-        actions_layout.addWidget(self.stop_btn)
-        actions_layout.addWidget(self.trigger_btn)
-        right_layout.addWidget(actions_box)
+        # Status panel
+        status_box = QtWidgets.QGroupBox("Status")
+        status_form = QtWidgets.QFormLayout(status_box)
+        status_form.setLabelAlignment(QtCore.Qt.AlignRight)
 
-        # PVA info
-        pva_box = QtWidgets.QGroupBox("PVAccess Stream")
-        pva_layout = QtWidgets.QFormLayout(pva_box)
-        pva_pv = ""
-        if self.ioc._pva_server is not None:
-            pva_pv = self.ioc._pva_server._pv_name
-        pva_edit = QtWidgets.QLineEdit(pva_pv)
-        pva_edit.setReadOnly(True)
-        pva_layout.addRow("PV name:", pva_edit)
-        right_layout.addWidget(pva_box)
+        # Camera connection indicator
+        cam_row = QtWidgets.QHBoxLayout()
+        self.cam_indicator = QtWidgets.QLabel("●")
+        connected = self.camera is not None and self.camera.is_open()
+        color = "#81c995" if connected else "#ff6b6b"
+        self.cam_indicator.setStyleSheet(f"color: {color}; font-size: 16px;")
+        cam_text = "Connected" if connected else "Disconnected"
+        if connected:
+            info = self.camera.get_info()
+            cam_text = f"{info.vendor} {info.model}"
+        self.cam_label = QtWidgets.QLabel(cam_text)
+        cam_row.addWidget(self.cam_indicator)
+        cam_row.addWidget(self.cam_label)
+        cam_row.addStretch()
+        status_form.addRow("Camera:", cam_row)
 
-        # Log
-        log_box = QtWidgets.QGroupBox("Log")
+        # Live status fields
+        for name, label in [
+            ("FrameCount", "Frames"),
+            ("AcquisitionFrameRate", "FPS"),
+            ("SensorTemperature", "Temp (°C)"),
+            ("SensorCoolerStatus", "Cooler"),
+        ]:
+            lbl = QtWidgets.QLabel("-")
+            status_form.addRow(label + ":", lbl)
+            self.status_labels[name] = lbl
+
+        # PVA stream PV (read-only display)
+        self.pva_edit = QtWidgets.QLineEdit("")
+        self.pva_edit.setReadOnly(True)
+        self.pva_edit.setToolTip("PVAccess NTNDArray PV name for pystream")
+        if self.ioc and getattr(self.ioc, "_pva_server", None) is not None:
+            self.pva_edit.setText(self.ioc._pva_server._pv_name)
+        status_form.addRow("PVA Stream:", self.pva_edit)
+
+        right_layout.addWidget(status_box)
+
+        # HDF5 file save panel
+        save_box = QtWidgets.QGroupBox("HDF5 File Save")
+        save_form = QtWidgets.QFormLayout(save_box)
+        save_form.setLabelAlignment(QtCore.Qt.AlignRight)
+
+        path_row = QtWidgets.QHBoxLayout()
+        self.save_path_edit = QtWidgets.QLineEdit()
+        self.save_path_edit.setPlaceholderText("/tmp/detector/")
+        self.save_path_edit.setText(
+            str(self.ioc.HDF1.FilePath._data["value"]) or "/tmp/detector/")
+        browse_btn = QtWidgets.QPushButton("Browse…")
+        browse_btn.setMaximumWidth(80)
+        browse_btn.clicked.connect(self._browse_save_path)
+        path_row.addWidget(self.save_path_edit)
+        path_row.addWidget(browse_btn)
+        save_form.addRow("Directory:", path_row)
+
+        self.save_name_edit = QtWidgets.QLineEdit("scan")
+        self.save_name_edit.setText(
+            str(self.ioc.HDF1.FileName._data["value"]) or "scan")
+        save_form.addRow("File name:", self.save_name_edit)
+
+        self.save_number_edit = QtWidgets.QLineEdit("1")
+        self.save_number_edit.setText(
+            str(int(self.ioc.HDF1.FileNumber._data["value"])))
+        save_form.addRow("File number:", self.save_number_edit)
+
+        self.save_count_edit = QtWidgets.QLineEdit("100")
+        self.save_count_edit.setText(
+            str(int(self.ioc.HDF1.NumCapture._data["value"])))
+        save_form.addRow("Frames to save:", self.save_count_edit)
+
+        self.save_status_label = QtWidgets.QLabel("Idle")
+        save_form.addRow("Status:", self.save_status_label)
+
+        self.save_captured_label = QtWidgets.QLabel("0")
+        save_form.addRow("Captured:", self.save_captured_label)
+
+        save_btn_row = QtWidgets.QHBoxLayout()
+        self.capture_btn = QtWidgets.QPushButton("Start Capture")
+        self.capture_btn.clicked.connect(self._toggle_capture)
+        save_btn_row.addWidget(self.capture_btn)
+        save_form.addRow("", save_btn_row)
+
+        right_layout.addWidget(save_box)
+
+        # Activity log
+        log_box = QtWidgets.QGroupBox("Activity Log")
         log_layout = QtWidgets.QVBoxLayout(log_box)
         self.log_edit = QtWidgets.QPlainTextEdit()
         self.log_edit.setReadOnly(True)
         log_layout.addWidget(self.log_edit)
         right_layout.addWidget(log_box, 1)
 
-        layout.addWidget(right, 1)
+        self.statusBar().showMessage("Ready")
 
-    def _make_widget(self, name: str) -> QtWidgets.QWidget:
+    def _create_tabs(self):
+        if not self.camera:
+            return
+        supported = set(self.camera.list_params())
+
+        # Place every supported param into the matching tab; unmatched go to "Other"
+        used: set = set()
+        for tab_title, items in PARAM_TABS:
+            tab_items = [(k, l) for k, l in items if k in supported]
+            if not tab_items:
+                continue
+            self._add_tab(tab_title, tab_items)
+            for k, _ in tab_items:
+                used.add(k)
+
+        leftover = sorted(supported - used)
+        if leftover:
+            self._add_tab("Other", [(k, k) for k in leftover])
+
+        # Always add a Device Info tab if we have CameraInfo
+        info = self.camera.get_info()
+        info_items = [
+            ("Vendor", info.vendor),
+            ("Model", info.model),
+            ("Serial Number", info.serial_number or "-"),
+            ("Firmware", info.firmware_version or "-"),
+            ("Sensor", f"{info.sensor_width} × {info.sensor_height}"),
+            ("Pixel Size", f"{info.pixel_size_um} µm"),
+            ("Bits/pixel", str(info.bits_per_pixel)),
+            ("Max FPS", f"{info.max_frame_rate}"),
+            ("Binning", str(info.supported_binning)),
+            ("Trigger Modes", ", ".join(info.supported_trigger_modes)),
+        ]
+        info_tab = QtWidgets.QWidget()
+        info_layout = QtWidgets.QFormLayout(info_tab)
+        info_layout.setLabelAlignment(QtCore.Qt.AlignRight)
+        for label, value in info_items:
+            lbl = QtWidgets.QLabel(str(value))
+            info_layout.addRow(label + ":", lbl)
+        self.param_tabs.addTab(info_tab, "Device Info")
+
+    def _add_tab(self, title: str, items: List[Tuple[str, str]]):
+        tab = QtWidgets.QWidget()
+        tab_layout = QtWidgets.QVBoxLayout(tab)
+        tab_layout.setContentsMargins(8, 8, 8, 8)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; }")
+        tab_layout.addWidget(scroll)
+
+        content = QtWidgets.QWidget()
+        scroll.setWidget(content)
+        form = QtWidgets.QFormLayout(content)
+        form.setLabelAlignment(QtCore.Qt.AlignRight)
+        form.setSpacing(8)
+
+        for key, label in items:
+            widget = self._make_widget(key)
+            if widget:
+                self.controls[key] = widget
+                form.addRow(label + ":", widget)
+
+        self.param_tabs.addTab(tab, title)
+
+    def _make_widget(self, key: str) -> Optional[QtWidgets.QWidget]:
         try:
-            value = self.camera.get_param(name)
+            value = self.camera.get_param(key)
         except Exception:
             return None
 
-        if name in ENUM_CHOICES:
+        if key in ENUM_CHOICES:
             combo = QtWidgets.QComboBox()
-            for choice in ENUM_CHOICES[name]:
+            for choice in ENUM_CHOICES[key]:
                 combo.addItem(str(choice), choice)
             idx = combo.findData(value)
             if idx < 0:
                 idx = combo.findText(str(value))
             if idx >= 0:
                 combo.setCurrentIndex(idx)
-            if name in READ_ONLY_PARAMS:
+            if key in READ_ONLY_PARAMS:
                 combo.setEnabled(False)
             else:
                 combo.currentIndexChanged.connect(
-                    lambda _, k=name: self._apply_single(k))
+                    lambda _, k=key: self._apply_single(k))
             return combo
 
         edit = QtWidgets.QLineEdit(str(value))
-        if name in READ_ONLY_PARAMS:
+        if key in READ_ONLY_PARAMS:
             edit.setReadOnly(True)
         else:
-            edit.returnPressed.connect(lambda k=name: self._apply_single(k))
+            edit.returnPressed.connect(lambda k=key: self._apply_single(k))
         return edit
 
+    # ---------- Value sync ----------
+
     def _populate_values(self):
-        for name, widget in self.controls.items():
+        for key, widget in self.controls.items():
             try:
-                val = self.camera.get_param(name)
+                val = self.camera.get_param(key)
                 self._set_widget_value(widget, val)
             except Exception:
                 pass
@@ -179,13 +426,41 @@ class DetectorGui(QtWidgets.QMainWindow):
     def _refresh_readonly(self):
         if not self.camera:
             return
-        for name in READ_ONLY_PARAMS:
-            if name in self.controls:
+        for key in READ_ONLY_PARAMS:
+            if key in self.controls:
                 try:
-                    val = self.camera.get_param(name)
-                    self._set_widget_value(self.controls[name], val)
+                    val = self.camera.get_param(key)
+                    self._set_widget_value(self.controls[key], val)
                 except Exception:
                     pass
+        # Sensor temperature / cooler status from camera
+        for key in ("SensorTemperature", "SensorCoolerStatus"):
+            if key in self.status_labels:
+                try:
+                    val = self.camera.get_param(key)
+                    self.status_labels[key].setText(str(val))
+                except Exception:
+                    pass
+        # Measured FPS (from frame callback timing, not camera property)
+        if "AcquisitionFrameRate" in self.status_labels:
+            self.status_labels["AcquisitionFrameRate"].setText(
+                f"{self._measured_fps:.1f}")
+
+        # HDF5 capture status
+        try:
+            hdf = self.ioc.HDF1
+            if hdf._capturing:
+                self.save_status_label.setText("Capturing")
+                self.capture_btn.setText("Stop Capture")
+            else:
+                self.save_status_label.setText("Idle")
+                self.capture_btn.setText("Start Capture")
+            self.save_captured_label.setText(str(hdf._frames_captured))
+            # Update file number from plugin (auto-increments)
+            self.save_number_edit.setText(
+                str(int(hdf.FileNumber._data["value"])))
+        except Exception:
+            pass
 
     def _set_widget_value(self, widget, value):
         if isinstance(widget, QtWidgets.QComboBox):
@@ -197,59 +472,222 @@ class DetectorGui(QtWidgets.QMainWindow):
         else:
             widget.setText(str(value))
 
-    def _apply_single(self, name: str):
-        widget = self.controls[name]
-        try:
-            if isinstance(widget, QtWidgets.QComboBox):
-                value = widget.currentData()
-                if value is None:
-                    value = widget.currentText()
-            else:
-                text = widget.text().strip()
-                if not text:
-                    return
-                current = self.camera.get_param(name)
-                if isinstance(current, bool):
-                    value = text.lower() in ("1", "true", "yes", "on")
-                elif isinstance(current, int):
-                    value = int(float(text))
-                elif isinstance(current, float):
-                    value = float(text)
-                else:
-                    value = text
-            old = self.camera.get_param(name)
-            if value != old:
-                self.camera.set_param(name, value)
-                self._log(f"{name}: {old} → {value}")
-        except Exception as exc:
-            self._log(f"{name}: {exc}")
-            QtWidgets.QMessageBox.warning(self, "Set parameter failed",
-                                          f"{name}: {exc}")
+    # ---------- Actions ----------
 
-    def _start(self):
+    def _read_widget_value(self, key: str, widget) -> Any:
+        if isinstance(widget, QtWidgets.QComboBox):
+            value = widget.currentData()
+            if value is None:
+                value = widget.currentText()
+            return value
+        text = widget.text().strip()
+        if not text:
+            return None
+        # Type-coerce based on current value
+        current = self.camera.get_param(key)
+        if isinstance(current, bool):
+            return text.lower() in ("1", "true", "yes", "on")
+        if isinstance(current, int) and not isinstance(current, bool):
+            return int(float(text))
+        if isinstance(current, float):
+            return float(text)
+        return text
+
+    def _apply_single(self, key: str):
+        widget = self.controls[key]
         try:
-            self.ioc.cam1.Acquire._data["value"] = 1
+            value = self._read_widget_value(key, widget)
+            if value is None:
+                return
+            old = self.camera.get_param(key)
+            if value != old:
+                self.camera.set_param(key, value)
+                self._log(f"{key}: {old} → {value}")
+                # Push to corresponding cam1: PV when relevant
+                self._sync_to_pv(key, value)
+        except Exception as exc:
+            self._log(f"✗ {key}: {exc}")
+
+    def _apply_all(self):
+        changed = []
+        for key, widget in self.controls.items():
+            if key in READ_ONLY_PARAMS:
+                continue
+            try:
+                value = self._read_widget_value(key, widget)
+                if value is None:
+                    continue
+                old = self.camera.get_param(key)
+                if value != old:
+                    self.camera.set_param(key, value)
+                    self._sync_to_pv(key, value)
+                    changed.append(f"{key}: {old} → {value}")
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(self, "Invalid parameter",
+                                              f"{key}: {exc}")
+                self._log(f"✗ {key}: {exc}")
+                return
+        if changed:
+            for c in changed:
+                self._log(f"  {c}")
+            self._log(f"Applied {len(changed)} parameter(s)")
+        else:
+            self._log("No parameters changed")
+        self.statusBar().showMessage("Parameters applied", 3000)
+
+    def _sync_to_pv(self, key: str, value: Any):
+        """Mirror common parameter changes into the corresponding cam1: PV."""
+        cam = self.ioc.cam1
+        try:
+            if key == "ExposureTime":
+                cam.AcquireTime._data["value"] = float(value)
+                cam.AcquireTime_RBV._data["value"] = float(value)
+            elif key == "BinningHorizontal":
+                cam.BinX._data["value"] = int(value)
+                cam.BinX_RBV._data["value"] = int(value)
+            elif key == "BinningVertical":
+                cam.BinY._data["value"] = int(value)
+                cam.BinY_RBV._data["value"] = int(value)
+            elif key == "TriggerMode":
+                cam.TriggerMode._data["value"] = str(value)
+                cam.TriggerMode_RBV._data["value"] = str(value)
+            elif key == "TriggerSource":
+                cam.TriggerSource._data["value"] = str(value)
+        except Exception:
+            pass
+
+    def _start_acquisition(self):
+        try:
+            self._fps_count = 0
+            self._fps_last_t = 0.0
+            self._measured_fps = 0.0
+            # Free-running until user clicks Stop
+            self.ioc.cam1.ImageMode._data["value"] = "Continuous"
+            self.ioc.cam1.NumImages._data["value"] = 0
             self.ioc.cam1._start_acquisition()
-            self._log("Started acquisition")
+            self._log("Acquisition started (continuous)")
         except Exception as exc:
             self._log(f"Start failed: {exc}")
 
-    def _stop(self):
+    def _stop_acquisition(self):
         try:
             self.ioc.cam1._stop_acquisition()
-            self._log("Stopped acquisition")
+            self._measured_fps = 0.0
+            self._log("Acquisition stopped")
         except Exception as exc:
             self._log(f"Stop failed: {exc}")
 
-    def _trigger(self):
+    def _single_frame(self):
+        try:
+            if not self.camera.is_acquiring():
+                self.camera.start_acquisition()
+                frame = self.camera.acquire_frame(timeout_ms=5000)
+                self.camera.stop_acquisition()
+            else:
+                frame = self.camera.acquire_frame(timeout_ms=5000)
+            self.last_frame = frame
+            self._log(f"Single frame: {frame.shape} mean={frame.mean():.1f}")
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Frame Error", str(exc))
+            self._log(f"Single frame failed: {exc}")
+
+    def _software_trigger(self):
         try:
             self.camera.software_trigger()
             self._log("Software trigger fired")
         except Exception as exc:
             self._log(f"Trigger failed: {exc}")
 
-    def _log(self, msg: str):
-        self.log_edit.appendPlainText(msg)
+    # ---------- HDF5 capture ----------
+
+    def _browse_save_path(self):
+        current = self.save_path_edit.text() or "/tmp"
+        directory = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Choose save directory", current)
+        if directory:
+            self.save_path_edit.setText(directory)
+
+    def _toggle_capture(self):
+        hdf = self.ioc.HDF1
+        if hdf._capturing:
+            self._stop_capture()
+        else:
+            self._start_capture()
+
+    def _start_capture(self):
+        hdf = self.ioc.HDF1
+        try:
+            path = self.save_path_edit.text().strip()
+            name = self.save_name_edit.text().strip() or "scan"
+            number = int(self.save_number_edit.text())
+            num = int(self.save_count_edit.text())
+            if num <= 0:
+                QtWidgets.QMessageBox.warning(self, "Invalid",
+                                              "Frames to save must be > 0")
+                return
+            if not path:
+                QtWidgets.QMessageBox.warning(self, "Invalid",
+                                              "Choose a directory first")
+                return
+            import os
+            os.makedirs(path, exist_ok=True)
+
+            # Push to HDF5 plugin's PVs
+            hdf.FilePath._data["value"] = path
+            hdf.FilePath_RBV._data["value"] = path
+            hdf.FilePathExists_RBV._data["value"] = 1
+            hdf.FileName._data["value"] = name
+            hdf.FileName_RBV._data["value"] = name
+            hdf.FileNumber._data["value"] = number
+            hdf.NumCapture._data["value"] = num
+
+            hdf._start_capture()
+            full = str(hdf.FullFileName_RBV._data["value"])
+            self._log(f"Capturing {num} frames to {full}")
+
+            # Optionally start acquisition if not already running
+            if not self.ioc.cam1._acquiring:
+                # Set image mode to Multiple with NumImages = num
+                self.ioc.cam1.ImageMode._data["value"] = "Multiple"
+                self.ioc.cam1.NumImages._data["value"] = num
+                self.ioc.cam1._start_acquisition()
+                self._log(f"Acquisition started ({num} frames)")
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Capture failed", str(exc))
+            self._log(f"Capture start failed: {exc}")
+
+    def _stop_capture(self):
+        try:
+            self.ioc.HDF1._stop_capture()
+            captured = self.ioc.HDF1._frames_captured
+            self._log(f"Capture stopped ({captured} frames written)")
+        except Exception as exc:
+            self._log(f"Stop capture failed: {exc}")
+
+    # ---------- Frame callback ----------
+
+    def _on_frame(self, frame, metadata: dict):
+        self.last_frame = frame
+        # Update frame count display
+        if "FrameCount" in self.status_labels:
+            self.status_labels["FrameCount"].setText(
+                str(metadata.get("frame_number", "-")))
+        # Measure fps from frame timing
+        now = time.time()
+        self._fps_count += 1
+        if self._fps_last_t == 0.0:
+            self._fps_last_t = now
+        elapsed = now - self._fps_last_t
+        if elapsed >= 1.0:
+            self._measured_fps = self._fps_count / elapsed
+            self._fps_count = 0
+            self._fps_last_t = now
+
+    # ---------- Misc ----------
+
+    def _log(self, message: str):
+        ts = time.strftime("%H:%M:%S")
+        self.log_edit.appendPlainText(f"[{ts}] {message}")
 
     def closeEvent(self, event):
         self._refresh_timer.stop()

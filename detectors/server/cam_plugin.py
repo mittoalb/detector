@@ -100,8 +100,13 @@ class CamPlugin(PVGroup):
         self._acq_thread = None
         self._frame_counter = 0
         self._frame_callbacks = []
+        self._end_callbacks = []
         self._software_trigger_event = threading.Event()
         self._async_loop = None
+        # Throttle CA ArrayData publishes (heavy serialization).
+        # Use PVA image1:ArrayData for full-rate live viewing.
+        self._array_data_max_fps = 5.0
+        self._array_data_last_t = 0.0
 
     def set_camera(self, camera: Optional[BaseCamera]) -> None:
         """Bind a BaseCamera to this plugin."""
@@ -130,6 +135,10 @@ class CamPlugin(PVGroup):
 
     def register_frame_callback(self, callback) -> None:
         self._frame_callbacks.append(callback)
+
+    def register_end_callback(self, callback) -> None:
+        """Register a callback called when acquisition stops (any reason)."""
+        self._end_callbacks.append(callback)
 
     def _publish(self, prop, value):
         """Thread-safe PV update with monitor notification."""
@@ -263,14 +272,25 @@ class CamPlugin(PVGroup):
                     "height": frame.shape[0],
                 }
 
+                # Update counters every frame (small, cheap)
                 self._publish(self.NumImagesCounter_RBV, self._frame_counter)
                 self._publish(self.ArrayCounter_RBV, self._frame_counter)
-                self._publish(self.ArraySize0_RBV, frame.shape[1])
-                self._publish(self.ArraySize1_RBV, frame.shape[0])
-                try:
-                    self._publish(self.ArrayData, frame.flatten())
-                except Exception:
-                    pass
+                # Size PVs only on shape change
+                if (frame.shape[1] != self.ArraySize0_RBV._data["value"] or
+                        frame.shape[0] != self.ArraySize1_RBV._data["value"]):
+                    self._publish(self.ArraySize0_RBV, frame.shape[1])
+                    self._publish(self.ArraySize1_RBV, frame.shape[0])
+                # CA ArrayData throttled — full-rate live view via PVA.
+                # 10M-element CA writes can't keep up with sensor rate.
+                now = time.time()
+                if (self._array_data_max_fps <= 0 or
+                        now - self._array_data_last_t >=
+                        1.0 / self._array_data_max_fps):
+                    self._array_data_last_t = now
+                    try:
+                        self._publish(self.ArrayData, frame.flatten())
+                    except Exception:
+                        pass
 
                 for cb in self._frame_callbacks:
                     try:
@@ -288,3 +308,9 @@ class CamPlugin(PVGroup):
             self._publish(self.AcquireBusy, 0)
             self._publish(self.Acquire, 0)
             logger.info("Acquisition stopped after %d frames", self._frame_counter)
+            # Notify any plugins (e.g. HDF5) that acquisition has ended
+            for cb in self._end_callbacks:
+                try:
+                    cb()
+                except Exception as exc:
+                    logger.error("End callback error: %s", exc)

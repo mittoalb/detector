@@ -104,9 +104,16 @@ class SimulatedCamera(BaseCamera):
             if not self._is_acquiring:
                 raise RuntimeError("Acquisition stopped")
         else:
-            time.sleep(self._params["ExposureTime"])
+            # Camera binning: sensor reads N times fewer rows, so the
+            # readout time scales with 1/binning. The total frame time
+            # is max(exposure, readout_time / binning^2).
+            binval = max(1, int(self._params["BinningHorizontal"]))
+            base_readout = 1.0 / 110.0  # ~110 fps full-frame readout
+            readout = base_readout / (binval * binval)
+            frame_time = max(self._params["ExposureTime"], readout)
+            time.sleep(frame_time)
 
-        binval = self._params["BinningHorizontal"]
+        binval = max(1, int(self._params["BinningHorizontal"]))
         w = self._params["Width"] // binval
         h = self._params["Height"] // binval
         frame = np.random.randint(100, 1000, (h, w), dtype=np.uint16)

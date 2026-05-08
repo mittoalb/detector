@@ -242,19 +242,20 @@ class OrcaFireDCAM(BaseCamera):
         if _dcam_lib.dcamwait_open(ctypes.byref(wait)) >= 0:
             self._hwait = wait.hwait
 
-        # Read static info
+        # Try DCAM properties for sensor dimensions, but they're unreliable
+        # on the C16240-20UP (return 1). Acquire one frame to get true size.
+        w, h = 0, 0
         try:
-            w = int(self._get_dcam(DCAM_IDPROP["ImageWidth"]))
-        except Exception:
-            w = 0
-        try:
-            h = int(self._get_dcam(DCAM_IDPROP["ImageHeight"]))
-        except Exception:
-            h = 0
+            w, h = self._probe_frame_size()
+        except Exception as exc:
+            logger.warning("Could not probe frame size: %s", exc)
+
+        if w == 0 or h == 0:
+            w, h = 4432, 2368  # Known ORCA Fire C16240-20UP active area
 
         self._info = CameraInfo(
             vendor="Hamamatsu", model="C16240-20UP",
-            sensor_width=w or 4432, sensor_height=h or 2368,
+            sensor_width=w, sensor_height=h,
             bits_per_pixel=16, pixel_size_um=4.6,
             max_frame_rate=115.0,
             supported_binning=[1, 2, 4],
@@ -263,6 +264,35 @@ class OrcaFireDCAM(BaseCamera):
             has_subarray=True,
         )
         logger.info("Opened %s (device %d)", self.display_name, self.device_index)
+
+    def _probe_frame_size(self) -> tuple:
+        """Acquire one frame to determine actual width and height."""
+        _dcam_lib.dcambuf_alloc(self._hdcam, 1)
+        try:
+            err = _dcam_lib.dcamcap_start(self._hdcam, DCAMCAP_START_SEQUENCE)
+            if err < 0:
+                return 0, 0
+            try:
+                if self._hwait:
+                    ws = DCAMWAIT_START()
+                    ws.size = ctypes.sizeof(DCAMWAIT_START)
+                    ws.eventmask = DCAMWAIT_CAPEVENT_FRAMEREADY
+                    ws.timeout = 5000
+                    if _dcam_lib.dcamwait_start(self._hwait, ctypes.byref(ws)) < 0:
+                        return 0, 0
+                info = DCAMCAP_TRANSFERINFO()
+                info.size = ctypes.sizeof(DCAMCAP_TRANSFERINFO)
+                _dcam_lib.dcamcap_transferinfo(self._hdcam, ctypes.byref(info))
+                frame = DCAMBUF_FRAME()
+                frame.size = ctypes.sizeof(DCAMBUF_FRAME)
+                frame.iFrame = info.nNewestFrameIndex
+                if _dcam_lib.dcambuf_lockframe(self._hdcam, ctypes.byref(frame)) < 0:
+                    return 0, 0
+                return frame.width, frame.height
+            finally:
+                _dcam_lib.dcamcap_stop(self._hdcam)
+        finally:
+            _dcam_lib.dcambuf_release(self._hdcam, 0)
 
     def close(self) -> None:
         if self._is_acquiring:
@@ -310,6 +340,45 @@ class OrcaFireDCAM(BaseCamera):
                 pass
         return supported
 
+    def set_subarray(self, hsize: int, vsize: int,
+                     hpos: Optional[int] = None,
+                     vpos: Optional[int] = None) -> None:
+        """Set a centered (or specified) SubArray (ROI) for cropped readout.
+
+        Cropped readout is the only way to exceed the camera's full-frame
+        max fps on the ORCA Fire. Smaller hsize/vsize → higher fps.
+
+        Args:
+            hsize: width in pixels (must be a multiple supported by camera)
+            vsize: height in pixels
+            hpos: top-left x (default: centered on sensor)
+            vpos: top-left y (default: centered on sensor)
+        """
+        was_acquiring = self._is_acquiring
+        if was_acquiring:
+            self.stop_acquisition()
+        try:
+            sw = self._info.sensor_width
+            sh = self._info.sensor_height
+            if hpos is None:
+                hpos = max(0, (sw - hsize) // 2)
+            if vpos is None:
+                vpos = max(0, (sh - vsize) // 2)
+            # Disable subarray to allow changing dimensions, then re-enable
+            try:
+                self._set_dcam(DCAM_IDPROP["SubarrayMode"], 1)  # OFF
+            except Exception:
+                pass
+            self._set_dcam(DCAM_IDPROP["SubarrayHPos"], float(hpos))
+            self._set_dcam(DCAM_IDPROP["SubarrayVPos"], float(vpos))
+            self._set_dcam(DCAM_IDPROP["SubarrayHSize"], float(hsize))
+            self._set_dcam(DCAM_IDPROP["SubarrayVSize"], float(vsize))
+            self._set_dcam(DCAM_IDPROP["SubarrayMode"], 2)  # ON
+            logger.info("SubArray: %dx%d at (%d, %d)", hsize, vsize, hpos, vpos)
+        finally:
+            if was_acquiring:
+                self.start_acquisition()
+
     def get_param(self, name: str) -> Any:
         # Standard parameter aliases
         if name in ("BinningHorizontal", "BinningVertical"):
@@ -337,8 +406,41 @@ class OrcaFireDCAM(BaseCamera):
 
     def set_param(self, name: str, value: Any) -> None:
         # Standard aliases
+        # SubArray dimension changes need acquisition stopped + mode toggle
+        if name in ("SubarrayHSize", "SubarrayVSize",
+                    "SubarrayHPos", "SubarrayVPos"):
+            was_acquiring = self._is_acquiring
+            if was_acquiring:
+                self.stop_acquisition()
+            try:
+                # Disable subarray so dimensions can be edited
+                try:
+                    self._set_dcam(DCAM_IDPROP["SubarrayMode"], 1)  # OFF
+                except Exception:
+                    pass
+                self._set_dcam(DCAM_IDPROP[name], float(int(value)))
+                self._set_dcam(DCAM_IDPROP["SubarrayMode"], 2)  # ON
+                logger.info("%s = %s (SubArray ON)", name, int(value))
+            finally:
+                if was_acquiring:
+                    self.start_acquisition()
+            return
+
         if name in ("BinningHorizontal", "BinningVertical"):
-            self._set_dcam(DCAM_IDPROP["Binning"], float(int(value)))
+            # Note: on the ORCA Fire C16240 family, DCAM 'Binning' is
+            # digital (post-readout pixel sum) — it shrinks the image
+            # but does NOT speed up the sensor. To actually gain fps,
+            # use SubarrayHSize / SubarrayVSize (cropped readout).
+            was_acquiring = self._is_acquiring
+            if was_acquiring:
+                self.stop_acquisition()
+            try:
+                self._set_dcam(DCAM_IDPROP["Binning"], float(int(value)))
+                actual = self._get_dcam(DCAM_IDPROP["Binning"])
+                logger.info("Binning set to %s, readback=%s", value, actual)
+            finally:
+                if was_acquiring:
+                    self.start_acquisition()
             return
         if name == "TriggerMode":
             if str(value) == "Off":
