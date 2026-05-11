@@ -103,6 +103,9 @@ class HDF5Plugin(PVGroup):
         self._dropped_frames = 0
         # Async loop reference for thread-safe PV publishes (set in startup).
         self._async_loop = None
+        # Diagnostic: count callback hits that were silently dropped because
+        # capture wasn't active. Helps catch logic bugs that lose frames.
+        self._not_capturing_drops = 0
 
     @NumCaptured_RBV.startup
     async def NumCaptured_RBV(self, instance, async_lib):
@@ -142,6 +145,11 @@ class HDF5Plugin(PVGroup):
     def on_frame(self, frame: np.ndarray, metadata: dict) -> None:
         """Frame callback — non-blocking enqueue to background writer."""
         if not self._capturing:
+            self._not_capturing_drops += 1
+            if self._not_capturing_drops % 25 == 1:
+                logger.warning(
+                    "HDF5: frame arrived while not capturing (count=%d, h5_open=%s)",
+                    self._not_capturing_drops, self._h5_file is not None)
             return
 
         # Size the queue based on available RAM and the actual frame bytes.
@@ -155,7 +163,16 @@ class HDF5Plugin(PVGroup):
             logger.info(
                 "HDF5 queue: %d frames (%.0f MB / frame, %.0f MB free RAM)",
                 qsize, frame_bytes / 1e6, free_mb)
-            # Start writer thread now (couldn't earlier — queue didn't exist)
+
+        # Writer thread watchdog: if missing or died, (re)start it.
+        # Tomoscan keeps one capture session across flats / projections /
+        # darks — the writer thread must outlive all phases.
+        if (self._write_thread is None
+                or not self._write_thread.is_alive()):
+            if self._write_thread is not None:
+                logger.warning(
+                    "HDF5 writer thread died, restarting (captured %d so far)",
+                    self._frames_captured)
             self._write_thread = threading.Thread(
                 target=self._writer_loop, daemon=True, name="hdf5-writer")
             self._write_thread.start()
@@ -172,16 +189,24 @@ class HDF5Plugin(PVGroup):
                                self._dropped_frames)
 
     def _writer_loop(self):
-        """Background thread: drain queue and write to HDF5."""
+        """Background thread: drain queue and write to HDF5.
+
+        Only exits on the sentinel (None) placed by _stop_capture, OR when
+        the HDF5 file has been closed (defensive). Does NOT exit just because
+        `_capturing` flips False — tomoscan stops/starts acquisition between
+        flat/projection/dark phases while keeping one capture session open,
+        so the writer must survive those gaps.
+        """
         while True:
             try:
                 item = self._write_queue.get(timeout=0.5)
             except queue.Empty:
-                if not self._capturing:
+                # File closed out from under us → no more work to do.
+                if self._h5_file is None:
                     return
                 continue
             if item is None:
-                # Sentinel — flush and exit
+                # Sentinel from _stop_capture — flush and exit.
                 return
 
             with self._lock:
@@ -225,8 +250,9 @@ class HDF5Plugin(PVGroup):
                                    self._frames_captured)
 
                     if num_capture > 0 and self._frames_captured >= num_capture:
-                        # Don't recurse via _stop_capture (it joins this thread).
-                        # Just signal the cam_plugin via end_callback path.
+                        # Target reached. Mark not-capturing; the cam_plugin
+                        # end_callback path (_maybe_stop_capture) will close
+                        # the file. We can exit this thread cleanly.
                         self._capturing = False
                         return
                 except Exception as exc:
@@ -267,11 +293,14 @@ class HDF5Plugin(PVGroup):
                 self._write_thread = None
                 self._frames_captured = 0
                 self._dropped_frames = 0
+                self._not_capturing_drops = 0
                 self._capturing = True
-                self.Capture_RBV._data["value"] = 1
-                self.WriteStatus._data["value"] = "Capturing"
+                self._publish(self.Capture_RBV, 1)
+                self._publish(self.WriteStatus, "Capturing")
+                self._publish(self.FullFileName_RBV, full_name)
+                self._publish(self.NumCaptured_RBV, 0)
+                # Also poke the underlying values so synchronous reads work
                 self.FullFileName_RBV._data["value"] = full_name
-                self.NumCaptured_RBV._data["value"] = 0
                 logger.info("HDF5: capturing to %s", full_name)
             except Exception as exc:
                 logger.error("Failed to open HDF5 file: %s", exc)
