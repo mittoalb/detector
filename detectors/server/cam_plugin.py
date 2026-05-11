@@ -95,6 +95,14 @@ class CamPlugin(PVGroup):
     ArrayCallbacks = pvproperty(value="Enable", dtype=ChannelType.ENUM,
                                  enum_strings=["Disable", "Enable"])
 
+    # FrameType: tomoscan sets this to "Projection", "FlatField", or
+    # "DarkField" before each scan phase. The HDF5 plugin reads it
+    # (via the per-frame metadata) to route frames to /exchange/data,
+    # /exchange/data_white, or /exchange/data_dark respectively.
+    FrameType = pvproperty(value="Projection", dtype=ChannelType.ENUM,
+                            enum_strings=["Projection", "FlatField",
+                                           "DarkField"])
+
     # NDArray output
     ArrayData = pvproperty(value=np.zeros(1, dtype=np.uint16),
                            dtype=ChannelType.INT, max_length=4480 * 2368)
@@ -145,6 +153,17 @@ class CamPlugin(PVGroup):
             self.AcquireTime_RBV._data["value"] = float(exp)
         except Exception:
             pass
+        # Sync trigger PVs to the camera's actual state so GUI/EPICS clients
+        # see the hardware defaults (TriggerSource=External etc.) on startup.
+        try:
+            src = str(camera.get_param("TriggerSource"))
+            self.TriggerSource._data["value"] = src
+            # TriggerMode "On" iff TriggerSource is External
+            tmode = "On" if src == "External" else "Off"
+            self.TriggerMode._data["value"] = tmode
+            self.TriggerMode_RBV._data["value"] = tmode
+        except Exception:
+            pass
         logger.info("CamPlugin bound to %s %s (%dx%d)",
                     info.vendor, info.model,
                     info.sensor_width, info.sensor_height)
@@ -168,6 +187,12 @@ class CamPlugin(PVGroup):
     @Acquire.putter
     async def Acquire(self, instance, value):
         if value in (1, "Acquire") and not self._acquiring:
+            # Publish AcquireBusy=1 SYNCHRONOUSLY before returning. Tomoscan's
+            # wait_camera_done() reads the cached monitor value right after
+            # its own Acquire.put returns; if AcquireBusy is still the stale
+            # 0 from the previous phase, it returns immediately and the
+            # current phase (e.g. dark fields) is skipped entirely.
+            await self.AcquireBusy.write(1)
             self._start_acquisition()
             return 1
         elif value in (0, "Done") or (value not in (1, "Acquire") and self._acquiring):
@@ -329,11 +354,19 @@ class CamPlugin(PVGroup):
                     continue
 
                 self._frame_counter += 1
+                # Read FrameType once per frame so the HDF5 plugin can route
+                # to the correct /exchange dataset (data / data_white /
+                # data_dark) without subscribing to the PV itself.
+                try:
+                    frame_type = str(self.FrameType.value)
+                except Exception:
+                    frame_type = "Projection"
                 metadata = {
                     "timestamp": time.time(),
                     "frame_number": self._frame_counter,
                     "width": frame.shape[1],
                     "height": frame.shape[0],
+                    "frame_type": frame_type,
                 }
 
                 # Update counters every frame (small, cheap)

@@ -363,6 +363,20 @@ class OrcaFireDCAM(BaseCamera):
             has_temperature=True, has_cooler=False,
             has_subarray=True,
         )
+
+        # Default trigger configuration: External / Edge / Positive.
+        # This is the configuration tomoscan PSO scans need; users can
+        # still flip back to Internal via the GUI or by EPICS put.
+        for prop, value in (("TriggerSource", "External"),
+                            ("TriggerActive", "Edge"),
+                            ("TriggerPolarity", "Positive")):
+            try:
+                self._set_dcam(DCAM_IDPROP[prop],
+                                ENUM_TO_DCAM[prop][value])
+            except Exception as exc:
+                logger.warning("Could not set default %s=%s: %s",
+                                prop, value, exc)
+
         logger.info("Opened %s (device %d)", self.display_name, self.device_index)
 
     def _probe_frame_size(self) -> tuple:

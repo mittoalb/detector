@@ -56,6 +56,15 @@ from caproto.server import PVGroup, pvproperty
 logger = logging.getLogger(__name__)
 
 
+# FrameType -> HDF5 dataset path. Tomoscan's add_theta() reads
+# /defaults/HDF5FrameLocation and matches these exact strings.
+_FRAME_TYPE_TO_DATASET = {
+    "Projection": "/exchange/data",
+    "FlatField":  "/exchange/data_white",
+    "DarkField":  "/exchange/data_dark",
+}
+
+
 class HDF5Plugin(PVGroup):
     """areaDetector HDF1: PVs for HDF5 file writing."""
 
@@ -97,8 +106,16 @@ class HDF5Plugin(PVGroup):
         self._lock = threading.RLock()
         self._capturing = False
         self._h5_file = None
-        self._h5_dataset = None
+        # One HDF5 dataset per FrameType. Created lazily on the first frame
+        # of that type. Tomoscan's add_theta reads all three.
+        self._h5_datasets: dict = {}  # frame_type -> dataset
+        self._dataset_counts: dict = {}  # frame_type -> frames written
         self._frames_captured = 0
+        # Per-frame index arrays written to /defaults at close. Tomoscan's
+        # add_theta reads these to identify which frames are projections /
+        # flats / darks (by HDF5FrameLocation).
+        self._unique_ids: list = []
+        self._frame_locations: list = []
         # Flush every N frames (set to ~1s worth at expected fps)
         self._flush_every = 100
         # Background HDF5 writer: queue + thread keep acquisition non-blocking
@@ -149,6 +166,38 @@ class HDF5Plugin(PVGroup):
             return 0
         return value
 
+    def _get_or_create_dataset(self, frame_type: str, frame: np.ndarray):
+        """Lazily create a per-frame-type dataset on first frame.
+
+        Returns the dataset, or None if the frame_type is unrecognized.
+        """
+        path = _FRAME_TYPE_TO_DATASET.get(frame_type)
+        if path is None:
+            logger.warning("Unknown FrameType=%r; routing to /exchange/data",
+                            frame_type)
+            path = "/exchange/data"
+            frame_type = "Projection"
+
+        ds = self._h5_datasets.get(frame_type)
+        if ds is None:
+            try:
+                num_capture = int(self.NumCapture.value)
+            except Exception:
+                num_capture = 0
+            h, w = frame.shape[0], frame.shape[1]
+            # Initial size: 1 frame, grows on resize. Chunked along frame axis.
+            ds = self._h5_file.create_dataset(
+                path,
+                shape=(1, h, w),
+                maxshape=(None, h, w),
+                dtype=frame.dtype,
+                chunks=(1, h, w),
+            )
+            self._h5_datasets[frame_type] = ds
+            self._dataset_counts[frame_type] = 0
+            logger.info("HDF5: created dataset %s", path)
+        return ds, frame_type, path
+
     def on_frame(self, frame: np.ndarray, metadata: dict) -> None:
         """Frame callback — non-blocking enqueue to background writer."""
         if not self._capturing:
@@ -185,9 +234,13 @@ class HDF5Plugin(PVGroup):
             self._write_thread.start()
 
         # Make a contiguous copy now: the underlying buffer may be reused
-        # by the camera before the writer thread gets to it.
+        # by the camera before the writer thread gets to it. Bundle the
+        # FrameType from metadata so the writer can route to the right
+        # /exchange dataset.
+        frame_type = metadata.get("frame_type", "Projection") if metadata else "Projection"
+        item = (frame_type, np.ascontiguousarray(frame))
         try:
-            self._write_queue.put_nowait(np.ascontiguousarray(frame))
+            self._write_queue.put_nowait(item)
         except queue.Full:
             # Writer can't keep up — drop this frame
             self._dropped_frames += 1
@@ -221,34 +274,31 @@ class HDF5Plugin(PVGroup):
                     continue
                 try:
                     num_capture = int(self.NumCapture.value)
-                    frame = item
+                    frame_type, frame = item
 
-                    # Lazily create dataset from first frame's actual shape
-                    if self._h5_dataset is None:
-                        h, w = frame.shape[0], frame.shape[1]
-                        self._h5_dataset = self._h5_file.create_dataset(
-                            "/exchange/data",
-                            shape=(max(num_capture, 1), h, w),
-                            maxshape=(None, h, w),
-                            dtype=frame.dtype,
-                            chunks=(1, h, w),
-                        )
+                    ds, frame_type, path = self._get_or_create_dataset(
+                        frame_type, frame)
 
-                    idx = self._frames_captured
+                    # Grow the per-type dataset by 1 if needed.
+                    type_idx = self._dataset_counts[frame_type]
+                    if type_idx >= ds.shape[0]:
+                        ds.resize((type_idx + 1,) + ds.shape[1:])
 
-                    if idx >= self._h5_dataset.shape[0]:
-                        new_size = max(idx + 1, num_capture)
-                        self._h5_dataset.resize((new_size,) +
-                                                self._h5_dataset.shape[1:])
-
-                    if frame.shape != self._h5_dataset.shape[1:]:
+                    if frame.shape != ds.shape[1:]:
                         logger.warning(
                             "HDF5: frame shape %s != dataset %s, skipping",
-                            frame.shape, self._h5_dataset.shape[1:])
+                            frame.shape, ds.shape[1:])
                         continue
 
-                    self._h5_dataset[idx] = frame
+                    ds[type_idx] = frame
+                    self._dataset_counts[frame_type] = type_idx + 1
+
+                    # Tomoscan's add_theta needs one entry per frame in
+                    # the order frames were captured.
                     self._frames_captured += 1
+                    self._unique_ids.append(self._frames_captured)
+                    self._frame_locations.append(path.encode("ascii"))
+
                     if self._frames_captured % self._flush_every == 0:
                         self._h5_file.flush()
                     # Update PV and notify monitors so clients (tomoscan)
@@ -314,9 +364,12 @@ class HDF5Plugin(PVGroup):
 
             try:
                 self._h5_file = h5py.File(full_name, "w", libver="latest")
-                # Dataset, queue, and writer thread are created lazily on
-                # the first frame (we need the frame size to budget RAM).
-                self._h5_dataset = None
+                # Datasets, queue, and writer thread are created lazily on
+                # the first frame of each FrameType.
+                self._h5_datasets = {}
+                self._dataset_counts = {}
+                self._unique_ids = []
+                self._frame_locations = []
                 self._write_queue = None
                 self._write_thread = None
                 self._frames_captured = 0
@@ -334,7 +387,7 @@ class HDF5Plugin(PVGroup):
             except Exception as exc:
                 logger.error("Failed to open HDF5 file: %s", exc)
                 self._h5_file = None
-                self._h5_dataset = None
+                self._h5_datasets = {}
                 self._write_queue = None
 
     def _maybe_stop_capture(self):
@@ -382,13 +435,33 @@ class HDF5Plugin(PVGroup):
         with self._lock:
             if self._h5_file is not None:
                 try:
-                    # Trim to actual frames written
-                    if self._h5_dataset is not None and \
-                            self._frames_captured < self._h5_dataset.shape[0]:
-                        self._h5_dataset.resize(
-                            (self._frames_captured,) + self._h5_dataset.shape[1:])
+                    # Trim each per-type dataset to actual frames written.
+                    for ftype, ds in self._h5_datasets.items():
+                        count = self._dataset_counts.get(ftype, 0)
+                        if count < ds.shape[0]:
+                            ds.resize((count,) + ds.shape[1:])
+
+                    # Write per-frame index arrays that tomoscan's
+                    # add_theta() reads to identify projections / flats /
+                    # darks. Order matches the order frames were captured.
+                    if self._unique_ids:
+                        self._h5_file.create_dataset(
+                            "/defaults/NDArrayUniqueId",
+                            data=np.asarray(self._unique_ids, dtype=np.int32))
+                        # Fixed-length bytes (matches areaDetector). Width
+                        # picked to fit the longest /exchange/* path used.
+                        max_len = max(len(loc) for loc in self._frame_locations)
+                        loc_arr = np.asarray(self._frame_locations,
+                                              dtype=f"|S{max_len}")
+                        self._h5_file.create_dataset(
+                            "/defaults/HDF5FrameLocation", data=loc_arr)
+
                     self._h5_file.close()
-                    msg = f"HDF5: closed ({self._frames_captured} frames)"
+                    counts_str = ", ".join(
+                        f"{ftype}={c}"
+                        for ftype, c in self._dataset_counts.items())
+                    msg = (f"HDF5: closed ({self._frames_captured} frames; "
+                            f"{counts_str})")
                     if self._dropped_frames:
                         msg += f", {self._dropped_frames} dropped"
                     logger.info(msg)
@@ -396,7 +469,7 @@ class HDF5Plugin(PVGroup):
                     logger.error("HDF5 close error: %s", exc)
                 finally:
                     self._h5_file = None
-                    self._h5_dataset = None
+                    self._h5_datasets = {}
 
         if _to_str(self.AutoIncrement.value) == "Yes":
             next_num = int(self.FileNumber.value) + 1
