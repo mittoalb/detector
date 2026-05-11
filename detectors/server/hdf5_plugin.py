@@ -101,6 +101,20 @@ class HDF5Plugin(PVGroup):
         # Use up to RAM_BUDGET_FRAC of free system memory.
         self._ram_budget_frac = 0.25
         self._dropped_frames = 0
+        # Async loop reference for thread-safe PV publishes (set in startup).
+        self._async_loop = None
+
+    @NumCaptured_RBV.startup
+    async def NumCaptured_RBV(self, instance, async_lib):
+        import asyncio
+        self._async_loop = asyncio.get_running_loop()
+
+    def _publish(self, prop, value):
+        """Thread-safe PV update with monitor notification."""
+        import asyncio
+        if self._async_loop is not None:
+            asyncio.run_coroutine_threadsafe(prop.write(value),
+                                              self._async_loop)
 
     @FilePath.putter
     async def FilePath(self, instance, value):
@@ -205,7 +219,10 @@ class HDF5Plugin(PVGroup):
                     self._frames_captured += 1
                     if self._frames_captured % self._flush_every == 0:
                         self._h5_file.flush()
-                    self.NumCaptured_RBV._data["value"] = self._frames_captured
+                    # Update PV and notify monitors so clients (tomoscan)
+                    # see the counter advance.
+                    self._publish(self.NumCaptured_RBV,
+                                   self._frames_captured)
 
                     if num_capture > 0 and self._frames_captured >= num_capture:
                         # Don't recurse via _stop_capture (it joins this thread).
