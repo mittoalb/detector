@@ -211,21 +211,7 @@ detectors/
 run_ioc.py                   # Main entry point
 check_environment.py         # Environment / hardware checker
 firebird-driver-rhel9-patch/ # Patched Active Silicon driver source
-
-orca/                        # OLD ORCA-only code (kept for reference)
-run_orca_ioc.py              # OLD entry point
 ```
-
-## Migration from the old `orca/` package
-
-The original ORCA-only code in `orca/` is still functional and works with
-`run_orca_ioc.py`. New work should use the camera-agnostic structure:
-
-- `orca/dcam_acquirer.py` → `detectors/cameras/hamamatsu/orca_fire_dcam.py`
-- `orca/harvesters_orca_fire.py` → `detectors/cameras/hamamatsu/orca_fire_gentl.py`
-- `orca/epics_ad_server.py` → `detectors/server/{cam_plugin,hdf5_plugin,ntnda_server,ioc}.py`
-- `orca/qt_detector.py` → `detectors/gui/qt_gui.py`
-- `run_orca_ioc.py` → `run_ioc.py --camera hamamatsu.orca_fire_dcam`
 
 ## DCAM (Hamamatsu) notes
 

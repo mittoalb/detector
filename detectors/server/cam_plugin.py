@@ -89,8 +89,11 @@ class CamPlugin(PVGroup):
     WaitForPlugins = pvproperty(value="No", dtype=str, max_length=40)
     NDAttributesFile = pvproperty(value="", dtype=str, max_length=256)
     NDAttributesMacros = pvproperty(value="", dtype=str, max_length=256)
-    UniqueIdMode = pvproperty(value="Camera", dtype=str, max_length=40)
-    ArrayCallbacks = pvproperty(value="Enable", dtype=str, max_length=40)
+    UniqueIdMode = pvproperty(value="Camera", dtype=ChannelType.ENUM,
+                               enum_strings=["Driver", "User", "Camera",
+                                             "FileNumber"])
+    ArrayCallbacks = pvproperty(value="Enable", dtype=ChannelType.ENUM,
+                                 enum_strings=["Disable", "Enable"])
 
     # NDArray output
     ArrayData = pvproperty(value=np.zeros(1, dtype=np.uint16),

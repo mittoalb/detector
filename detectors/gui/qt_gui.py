@@ -618,11 +618,27 @@ class DetectorGui(QtWidgets.QMainWindow):
             self._fps_count = 0
             self._fps_last_t = 0.0
             self._measured_fps = 0.0
+            # Force a clean free-running state regardless of any external
+            # trigger config left over from previous use (e.g. tomoscan).
+            if self.camera:
+                try:
+                    self.camera.set_param("TriggerMode", "Off")
+                except Exception:
+                    pass
+                try:
+                    self.camera.set_param("TriggerSource", "Internal")
+                except Exception:
+                    pass
             # Free-running until user clicks Stop
             self.ioc.cam1.ImageMode._data["value"] = "Continuous"
             self.ioc.cam1.NumImages._data["value"] = 0
+            self.ioc.cam1.TriggerMode._data["value"] = "Off"
+            self.ioc.cam1.TriggerMode_RBV._data["value"] = "Off"
+            self.ioc.cam1.TriggerSource._data["value"] = "Internal"
             self.ioc.cam1._start_acquisition()
-            self._log("Acquisition started (continuous)")
+            # Refresh widget values
+            self._populate_values()
+            self._log("Acquisition started (continuous, free-run)")
         except Exception as exc:
             self._log(f"Start failed: {exc}")
 
