@@ -543,20 +543,27 @@ class OrcaFireDCAM(BaseCamera):
                     self.start_acquisition()
             return
         if name == "TriggerMode":
-            if str(value) == "Off":
-                self._set_dcam(DCAM_IDPROP["TriggerSource"],
-                                ENUM_TO_DCAM["TriggerSource"]["Internal"])
-            else:
-                # Force DCAM TriggerMode = Normal (one frame per trigger).
-                # Without this, the camera may stay in a previous mode
-                # (Start/PIV/MultiGate) and ignore individual triggers.
-                try:
-                    self._set_dcam(DCAM_IDPROP["TriggerMode"],
-                                    ENUM_TO_DCAM["TriggerMode"]["Normal"])
-                except Exception as exc:
-                    logger.warning("Couldn't set TriggerMode=Normal: %s", exc)
-                self._set_dcam(DCAM_IDPROP["TriggerSource"],
-                                ENUM_TO_DCAM["TriggerSource"]["External"])
+            # DCAM trigger properties can only be set while the camera is
+            # idle. Stop acquisition, change, restart.
+            was_acquiring = self._is_acquiring
+            if was_acquiring:
+                self.stop_acquisition()
+            try:
+                if str(value) == "Off":
+                    self._set_dcam(DCAM_IDPROP["TriggerSource"],
+                                    ENUM_TO_DCAM["TriggerSource"]["Internal"])
+                else:
+                    try:
+                        self._set_dcam(DCAM_IDPROP["TriggerMode"],
+                                        ENUM_TO_DCAM["TriggerMode"]["Normal"])
+                    except Exception as exc:
+                        logger.warning("Couldn't set TriggerMode=Normal: %s",
+                                        exc)
+                    self._set_dcam(DCAM_IDPROP["TriggerSource"],
+                                    ENUM_TO_DCAM["TriggerSource"]["External"])
+            finally:
+                if was_acquiring:
+                    self.start_acquisition()
             return
 
         prop_id = DCAM_IDPROP.get(name)
