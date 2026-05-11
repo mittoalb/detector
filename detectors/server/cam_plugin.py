@@ -31,10 +31,13 @@ class CamPlugin(PVGroup):
     Model_RBV = pvproperty(value="", dtype=str, max_length=40, read_only=True)
     PortName_RBV = pvproperty(value="CAM1", dtype=str, max_length=40, read_only=True)
 
-    # Acquisition
-    Acquire = pvproperty(value=0, dtype=int)
-    AcquireBusy = pvproperty(value=0, dtype=int, read_only=True)
-    ImageMode = pvproperty(value="Continuous", dtype=str, max_length=40)
+    # Acquisition (enum PVs accept both string and int values from clients)
+    Acquire = pvproperty(value="Done", dtype=ChannelType.ENUM,
+                          enum_strings=["Done", "Acquire"])
+    AcquireBusy = pvproperty(value="Done", dtype=ChannelType.ENUM,
+                              enum_strings=["Done", "Busy"], read_only=True)
+    ImageMode = pvproperty(value="Continuous", dtype=ChannelType.ENUM,
+                            enum_strings=["Single", "Multiple", "Continuous"])
     NumImages = pvproperty(value=1, dtype=int)
     NumImagesCounter_RBV = pvproperty(value=0, dtype=int, read_only=True)
     ArrayCounter_RBV = pvproperty(value=0, dtype=int, read_only=True)
@@ -62,11 +65,16 @@ class CamPlugin(PVGroup):
     MinY = pvproperty(value=0, dtype=int)
 
     # Trigger
-    TriggerMode = pvproperty(value="Off", dtype=str, max_length=40)
-    TriggerMode_RBV = pvproperty(value="Off", dtype=str, max_length=40, read_only=True)
-    TriggerSource = pvproperty(value="Internal", dtype=str, max_length=40)
+    TriggerMode = pvproperty(value="Off", dtype=ChannelType.ENUM,
+                              enum_strings=["Off", "On"])
+    TriggerMode_RBV = pvproperty(value="Off", dtype=ChannelType.ENUM,
+                                  enum_strings=["Off", "On"], read_only=True)
+    TriggerSource = pvproperty(value="Internal", dtype=ChannelType.ENUM,
+                                enum_strings=["Internal", "External", "Software",
+                                              "MasterPulse"])
     TriggerSoftware = pvproperty(value=0, dtype=int)
-    TriggerOverlap = pvproperty(value="Off", dtype=str, max_length=40)
+    TriggerOverlap = pvproperty(value="Off", dtype=ChannelType.ENUM,
+                                 enum_strings=["Off", "ReadOut"])
     ExposureMode = pvproperty(value="Timed", dtype=str, max_length=40)
     FrameRateEnable = pvproperty(value=0, dtype=int)
 
@@ -81,7 +89,7 @@ class CamPlugin(PVGroup):
     WaitForPlugins = pvproperty(value="No", dtype=str, max_length=40)
     NDAttributesFile = pvproperty(value="", dtype=str, max_length=256)
     NDAttributesMacros = pvproperty(value="", dtype=str, max_length=256)
-    UniqueIdMode = pvproperty(value=0, dtype=int)
+    UniqueIdMode = pvproperty(value="Camera", dtype=str, max_length=40)
     ArrayCallbacks = pvproperty(value="Enable", dtype=str, max_length=40)
 
     # NDArray output
@@ -89,6 +97,9 @@ class CamPlugin(PVGroup):
                            dtype=ChannelType.INT, max_length=4480 * 2368)
     ArraySize0_RBV = pvproperty(value=4432, dtype=int, read_only=True)
     ArraySize1_RBV = pvproperty(value=2368, dtype=int, read_only=True)
+    # tomoscan / areaDetector also use ArraySizeX_RBV / ArraySizeY_RBV
+    ArraySizeX_RBV = pvproperty(value=4432, dtype=int, read_only=True)
+    ArraySizeY_RBV = pvproperty(value=2368, dtype=int, read_only=True)
     NDimensions_RBV = pvproperty(value=2, dtype=int, read_only=True)
     ColorMode_RBV = pvproperty(value=0, dtype=int, read_only=True)
     DataType_RBV = pvproperty(value="UInt16", dtype=str, max_length=40, read_only=True)
@@ -122,6 +133,8 @@ class CamPlugin(PVGroup):
         self.MaxSizeY_RBV._data["value"] = info.sensor_height
         self.ArraySize0_RBV._data["value"] = info.sensor_width
         self.ArraySize1_RBV._data["value"] = info.sensor_height
+        self.ArraySizeX_RBV._data["value"] = info.sensor_width
+        self.ArraySizeY_RBV._data["value"] = info.sensor_height
         # Read live ExposureTime
         try:
             exp = camera.get_param("ExposureTime")
@@ -191,6 +204,40 @@ class CamPlugin(PVGroup):
                 except Exception:
                     pass
         return value
+
+    @TriggerSource.putter
+    async def TriggerSource(self, instance, value):
+        v = str(value)
+        if self._camera:
+            try:
+                self._camera.set_param("TriggerSource", v)
+            except Exception as exc:
+                logger.warning("Failed to set TriggerSource: %s", exc)
+        return v
+
+    @ExposureMode.putter
+    async def ExposureMode(self, instance, value):
+        # Standard areaDetector enum, mostly informational on DCAM cameras
+        return str(value)
+
+    @TriggerOverlap.putter
+    async def TriggerOverlap(self, instance, value):
+        # areaDetector compat: "Off" or "ReadOut". On DCAM cameras this is
+        # controlled via TriggerGlobalExposure ("DelayedReadout" maps to
+        # ReadOut overlap).
+        v = str(value)
+        if self._camera:
+            try:
+                if v in ("ReadOut", "Readout"):
+                    self._camera.set_param("TriggerGlobalExposure",
+                                            "DelayedReadout")
+            except Exception as exc:
+                logger.warning("Failed to set TriggerOverlap: %s", exc)
+        return v
+
+    @FrameRateEnable.putter
+    async def FrameRateEnable(self, instance, value):
+        return int(value)
 
     @BinX.putter
     async def BinX(self, instance, value):
@@ -280,6 +327,8 @@ class CamPlugin(PVGroup):
                         frame.shape[0] != self.ArraySize1_RBV._data["value"]):
                     self._publish(self.ArraySize0_RBV, frame.shape[1])
                     self._publish(self.ArraySize1_RBV, frame.shape[0])
+                    self._publish(self.ArraySizeX_RBV, frame.shape[1])
+                    self._publish(self.ArraySizeY_RBV, frame.shape[0])
                 # CA ArrayData throttled — full-rate live view via PVA.
                 # 10M-element CA writes can't keep up with sensor rate.
                 now = time.time()

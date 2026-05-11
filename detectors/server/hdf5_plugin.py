@@ -13,6 +13,8 @@ from typing import Optional
 
 import numpy as np
 
+from caproto import ChannelType
+
 
 def _free_ram_bytes() -> int:
     """Return free system memory in bytes (Linux). Returns 0 if unknown."""
@@ -32,6 +34,22 @@ def _compute_queue_size(frame_bytes: int, budget_frac: float = 0.25) -> int:
     if free <= 0 or frame_bytes <= 0:
         return 100  # safe default
     return max(8, int(free * budget_frac / frame_bytes))
+
+
+def _to_str(val) -> str:
+    """Convert a caproto string PV value to a Python str.
+
+    `pvproperty(dtype=str, max_length=N)` may return a numpy array of bytes
+    (CHAR array) instead of a Python string. This handles all forms.
+    """
+    if isinstance(val, str):
+        return val
+    if isinstance(val, bytes):
+        return val.decode("ascii", errors="replace").rstrip("\x00")
+    try:
+        return bytes(val).decode("ascii", errors="replace").rstrip("\x00")
+    except Exception:
+        return str(val)
 
 from caproto.server import PVGroup, pvproperty
 
@@ -59,8 +77,10 @@ class HDF5Plugin(PVGroup):
     FileWriteMode = pvproperty(value="Stream", dtype=str, max_length=40)
     NumCapture = pvproperty(value=1, dtype=int)
     NumCaptured_RBV = pvproperty(value=0, dtype=int, read_only=True)
-    Capture = pvproperty(value=0, dtype=int)
-    Capture_RBV = pvproperty(value=0, dtype=int, read_only=True)
+    Capture = pvproperty(value="Done", dtype=ChannelType.ENUM,
+                          enum_strings=["Done", "Capture"])
+    Capture_RBV = pvproperty(value="Done", dtype=ChannelType.ENUM,
+                              enum_strings=["Done", "Capture"], read_only=True)
     WriteStatus = pvproperty(value="Idle", dtype=str, max_length=40, read_only=True)
     XMLFileName = pvproperty(value="", dtype=str, max_length=256)
 
@@ -203,10 +223,12 @@ class HDF5Plugin(PVGroup):
             return
 
         with self._lock:
-            file_path = str(self.FilePath.value).rstrip("/")
-            file_name = str(self.FileName.value)
+            file_path = _to_str(self.FilePath.value).rstrip("/")
+            file_name = _to_str(self.FileName.value)
             file_num = int(self.FileNumber.value)
-            template = str(self.FileTemplate.value)
+            template = _to_str(self.FileTemplate.value)
+            logger.info("HDF5 start: path='%s' name='%s' num=%d",
+                         file_path, file_name, file_num)
 
             try:
                 full_name = template % (file_path + "/", file_name, file_num)

@@ -24,45 +24,145 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DCAM_IDPROP = {
-    "ExposureTime": 0x001F0110,
+    # Trigger
     "TriggerSource": 0x00100110,
     "TriggerActive": 0x00100120,
     "TriggerMode": 0x00100210,
     "TriggerPolarity": 0x00100220,
-    "TriggerDelay": 0x00100230,
+    "TriggerConnector": 0x00100230,
     "TriggerTimes": 0x00100240,
-    "Binning": 0x00401110,
+    "TriggerDelay": 0x00100260,
+    "InternalTriggerHandling": 0x00100270,
+    "TriggerEnableActive": 0x00100410,
+    "TriggerEnablePolarity": 0x00100420,
+
+    # Output trigger
+    "OutputTriggerSource": 0x001C0110,
+    "OutputTriggerPolarity": 0x001C0120,
+    "OutputTriggerActive": 0x001C0130,
+    "OutputTriggerDelay": 0x001C0140,
+    "OutputTriggerPeriod": 0x001C0150,
+    "OutputTriggerKind": 0x001C0160,
+    "OutputTriggerBaseSensor": 0x001C0170,
+
+    # Master pulse
+    "MasterPulseMode": 0x001E0020,
+    "MasterPulseInterval": 0x001E0040,
+    "MasterPulseBurstTimes": 0x001E0050,
+
+    # Exposure
+    "ExposureTime": 0x001F0110,
+    "ExposureTimeControl": 0x001F0130,
+    "TriggerFirstExposure": 0x001F0200,
+    "TriggerGlobalExposure": 0x001F0300,
+    "FirstTriggerBehavior": 0x001F0310,
+
+    # Sensor / cooling
+    "LightMode": 0x00200110,
+    "SensitivityMode": 0x00200210,
+    "Sensitivity": 0x00200220,
     "SensorTemperature": 0x00200310,
     "SensorCooler": 0x00200320,
     "SensorTemperatureTarget": 0x00200330,
     "SensorCoolerStatus": 0x00200340,
-    "SensorMode": 0x00400210,
+    "SensorCoolerFan": 0x00200350,
+    "SensorTemperatureMin": 0x00200370,
+    "SensorTemperatureMax": 0x00200380,
+    "SensorTemperatureStatus": 0x00200390,
+    "MechanicalShutter": 0x00200410,
+
+    # Image processing / correction
+    "ContrastGain": 0x00300120,
+    "ContrastOffset": 0x00300130,
+    "HighDynamicRangeMode": 0x00300150,
+    "InterFrameAluEnable": 0x00380010,
+    "RecursiveFilter": 0x00380110,
+    "RecursiveFilterFrames": 0x00380120,
+    "SpotNoiseReducer": 0x00380130,
+    "SensorGapCorrectMode": 0x00380620,
+    "FrameAveragingMode": 0x003803A0,
+    "FrameAveragingFrames": 0x003803B0,
+    "DefectCorrectMode": 0x00470010,
+    "HotPixelCorrectLevel": 0x00470030,
+
+    # Readout
     "ReadoutSpeed": 0x00400110,
     "ReadoutDirection": 0x00400130,
+    "ReadoutUnit": 0x00400140,
     "ShutterMode": 0x00400150,
-    "SubarrayMode": 0x00402350,
+    "SensorMode": 0x00400210,
+    "OutputIntensity": 0x00400410,
+    "TestPatternKind": 0x00400510,
+
+    # Binning / SubArray
+    "Binning": 0x00401110,
+    "BinningIndependent": 0x00401120,
+    "BinningHorz": 0x00401130,
+    "BinningVert": 0x00401140,
     "SubarrayHPos": 0x00402110,
     "SubarrayHSize": 0x00402120,
-    "SubarrayVPos": 0x00402310,
-    "SubarrayVSize": 0x00402320,
-    "ImageWidth": 0x00420110,
-    "ImageHeight": 0x00420120,
-    "ImageRowBytes": 0x00420130,
+    "SubarrayVPos": 0x00402130,
+    "SubarrayVSize": 0x00402140,
+    "SubarrayMode": 0x00402150,
+    "DigitalBinningMethod": 0x00402160,
+    "DigitalBinningHorz": 0x00402170,
+    "DigitalBinningVert": 0x00402180,
+
+    # Timing
+    "TimingReadoutTime": 0x00403010,
+    "TimingExposure": 0x00403060,
+    "InternalFrameRate": 0x00403810,
+    "InternalFrameInterval": 0x00403820,
+    "InternalLineRate": 0x00403830,
+    "InternalLineInterval": 0x00403850,
+
+    # Image format
+    "BitsPerChannel": 0x00420130,
+    "ImageWidth": 0x00420210,
+    "ImageHeight": 0x00420220,
+    "ImageRowBytes": 0x00420230,
+    "ImageFrameBytes": 0x00420240,
     "ImagePixelType": 0x00420270,
-    "InternalFrameRate": 0x00420210,
+
+    # System
+    "SystemAlive": 0x00FF0010,
 }
 
 ENUM_TO_DCAM = {
     "TriggerSource": {"Internal": 1, "External": 2, "Software": 3, "MasterPulse": 4},
     "TriggerActive": {"Edge": 1, "Level": 2, "SyncReadout": 3, "Point": 4},
     "TriggerPolarity": {"Negative": 1, "Positive": 2},
-    "TriggerMode": {"Normal": 1, "Start": 6},
+    "TriggerMode": {"Normal": 1, "PIV": 3, "Start": 6, "MultiGate": 7,
+                     "MultiFrame": 8},
+    "TriggerConnector": {"Interface": 1, "BNC": 2, "Multi": 3},
+    "OutputTriggerKind": {"Low": 1, "ExposureTiming": 2, "ProgramAble": 3,
+                           "TriggerReady": 4, "High": 5, "AnyRowExposureTiming": 6,
+                           "ReadoutEnd": 7},
+    "OutputTriggerPolarity": {"Negative": 1, "Positive": 2},
+    "OutputTriggerActive": {"Edge": 1, "Level": 2},
     "ShutterMode": {"Global": 1, "Rolling": 2},
-    "SensorMode": {"Area": 1, "Lightsheet": 14, "SplitView": 17, "DualLightsheet": 12},
-    "ReadoutSpeed": {"Slowest": 1, "Fastest": 2, "Fast": 2},
-    "ReadoutDirection": {"Forward": 1, "Backward": 2, "Bidirectional": 3, "Reverse": 4},
+    "SensorMode": {"Area": 1, "Lightsheet": 14, "SplitView": 17,
+                    "DualLightsheet": 12, "PartialArea": 16},
+    "ReadoutSpeed": {"Slowest": 1, "Fastest": 0x7FFFFFFF},
+    "ReadoutDirection": {"Forward": 1, "Backward": 2, "Bidirectional": 3,
+                          "Reverse": 5, "Diverge": 6, "ReverseBidirectional": 7},
     "SensorCooler": {"Off": 1, "On": 2, "Max": 4},
-    "SensorCoolerStatus": {"Error": 0, "Off": 1, "Ready": 2, "Busy": 3, "Always": 4},
+    "SensorCoolerFan": {"Off": 1, "On": 2},
+    "SensorCoolerStatus": {"Error": 0, "Off": 1, "Ready": 2, "Busy": 3,
+                             "Always": 4, "Warning": 5},
+    "SubarrayMode": {"OFF": 1, "ON": 2},
+    "DefectCorrectMode": {"Off": 1, "On": 2},
+    "HotPixelCorrectLevel": {"Standard": 1, "Minimum": 2, "Aggressive": 3},
+    "MechanicalShutter": {"Auto": 1, "Close": 2, "Open": 3},
+    "RecursiveFilter": {"Off": 1, "On": 2},
+    "SpotNoiseReducer": {"Off": 1, "On": 2},
+    "HighDynamicRangeMode": {"Off": 1, "On": 2},
+    "MasterPulseMode": {"Continuous": 1, "Start": 2, "Burst": 3},
+    "FrameAveragingMode": {"Off": 1, "On": 2},
+    "InterFrameAluEnable": {"Off": 1, "On": 2},
+    "TriggerFirstExposure": {"NewFrame": 1, "Current": 2},
+    "TriggerGlobalExposure": {"None": 1, "AlwaysOpen": 2, "DelayedReadout": 3,
+                                "Emulate": 4, "GlobalReset": 5},
 }
 
 DCAM_TO_ENUM = {k: {n: s for s, n in v.items()} for k, v in ENUM_TO_DCAM.items()}
@@ -381,7 +481,7 @@ class OrcaFireDCAM(BaseCamera):
 
     def get_param(self, name: str) -> Any:
         # Standard parameter aliases
-        if name in ("BinningHorizontal", "BinningVertical"):
+        if name in ("BinningHorizontal", "BinningVertical", "Binning"):
             val = self._get_dcam(DCAM_IDPROP["Binning"])
             return int(val)
         if name == "Width":
@@ -426,7 +526,7 @@ class OrcaFireDCAM(BaseCamera):
                     self.start_acquisition()
             return
 
-        if name in ("BinningHorizontal", "BinningVertical"):
+        if name in ("BinningHorizontal", "BinningVertical", "Binning"):
             # Note: on the ORCA Fire C16240 family, DCAM 'Binning' is
             # digital (post-readout pixel sum) — it shrinks the image
             # but does NOT speed up the sensor. To actually gain fps,
@@ -447,6 +547,14 @@ class OrcaFireDCAM(BaseCamera):
                 self._set_dcam(DCAM_IDPROP["TriggerSource"],
                                 ENUM_TO_DCAM["TriggerSource"]["Internal"])
             else:
+                # Force DCAM TriggerMode = Normal (one frame per trigger).
+                # Without this, the camera may stay in a previous mode
+                # (Start/PIV/MultiGate) and ignore individual triggers.
+                try:
+                    self._set_dcam(DCAM_IDPROP["TriggerMode"],
+                                    ENUM_TO_DCAM["TriggerMode"]["Normal"])
+                except Exception as exc:
+                    logger.warning("Couldn't set TriggerMode=Normal: %s", exc)
                 self._set_dcam(DCAM_IDPROP["TriggerSource"],
                                 ENUM_TO_DCAM["TriggerSource"]["External"])
             return
