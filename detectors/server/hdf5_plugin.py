@@ -141,6 +141,8 @@ class HDF5Plugin(PVGroup):
 
     @Capture.putter
     async def Capture(self, instance, value):
+        logger.info("HDF1:Capture putter received value=%r (was capturing=%s)",
+                     value, self._capturing)
         if value in (1, "Capture") and not self._capturing:
             self._start_capture()
             return 1
@@ -260,6 +262,9 @@ class HDF5Plugin(PVGroup):
                         # Target reached. Mark not-capturing; the cam_plugin
                         # end_callback path (_maybe_stop_capture) will close
                         # the file. We can exit this thread cleanly.
+                        logger.info(
+                            "writer_loop: target reached (%d >= %d), exiting",
+                            self._frames_captured, num_capture)
                         self._capturing = False
                         return
                 except Exception as exc:
@@ -340,19 +345,28 @@ class HDF5Plugin(PVGroup):
         frames coming (e.g. tomoscan flats → projections → darks)."""
         try:
             num_capture = int(self.NumCapture.value)
-        except Exception:
+        except Exception as exc:
+            logger.warning("_maybe_stop_capture: NumCapture read failed (%s); "
+                            "treating as 0", exc)
             num_capture = 0
+        logger.info("_maybe_stop_capture: capturing=%s frames=%d num_capture=%d",
+                     self._capturing, self._frames_captured, num_capture)
         if not self._capturing:
             return  # already stopped
         if num_capture > 0 and self._frames_captured >= num_capture:
-            logger.info("HDF5: capture target reached, closing file")
+            logger.info("HDF5: capture target reached (%d >= %d), closing file",
+                         self._frames_captured, num_capture)
             self._stop_capture()
         else:
-            logger.debug("HDF5: acquisition ended but capture still active "
-                          "(%d/%d frames). Keeping file open.",
-                          self._frames_captured, num_capture)
+            logger.info("HDF5: acquisition phase ended (%d/%d frames). "
+                         "Keeping file open for next phase.",
+                         self._frames_captured, num_capture)
 
     def _stop_capture(self):
+        import traceback
+        logger.info("_stop_capture called (frames=%d). Stack:\n%s",
+                     self._frames_captured,
+                     "".join(traceback.format_stack(limit=6)))
         self._capturing = False
         self.Capture_RBV._data["value"] = 0
         self._publish(self.WriteMessage, "Idle")
