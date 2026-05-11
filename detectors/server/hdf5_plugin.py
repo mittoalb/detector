@@ -262,6 +262,24 @@ class HDF5Plugin(PVGroup):
                 self._h5_dataset = None
                 self._write_queue = None
 
+    def _maybe_stop_capture(self):
+        """Called when acquisition ends. Only close HDF5 if the capture
+        target was reached. Otherwise keep file open — there are more
+        frames coming (e.g. tomoscan flats → projections → darks)."""
+        try:
+            num_capture = int(self.NumCapture.value)
+        except Exception:
+            num_capture = 0
+        if not self._capturing:
+            return  # already stopped
+        if num_capture > 0 and self._frames_captured >= num_capture:
+            logger.info("HDF5: capture target reached, closing file")
+            self._stop_capture()
+        else:
+            logger.debug("HDF5: acquisition ended but capture still active "
+                          "(%d/%d frames). Keeping file open.",
+                          self._frames_captured, num_capture)
+
     def _stop_capture(self):
         self._capturing = False
         self.Capture_RBV._data["value"] = 0

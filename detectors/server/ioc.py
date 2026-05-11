@@ -42,8 +42,11 @@ class DetectorIOC(PVGroup):
         self.camera = camera
         self.cam1.set_camera(camera)
         self.cam1.register_frame_callback(self.HDF1.on_frame)
-        # Stop HDF5 capture when acquisition ends (avoids leaving file locked)
-        self.cam1.register_end_callback(self.HDF1._stop_capture)
+        # When acquisition ends, close HDF5 only if NumCapture target was
+        # reached. Tomoscan keeps one capture session across multiple
+        # acquisitions (flats / projections / darks), so we must not
+        # auto-close between phases.
+        self.cam1.register_end_callback(self.HDF1._maybe_stop_capture)
 
         # PVA NTNDArray server
         prefix = self.prefix if hasattr(self, "prefix") else ""
