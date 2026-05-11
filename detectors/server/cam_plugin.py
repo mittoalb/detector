@@ -285,8 +285,16 @@ class CamPlugin(PVGroup):
                                            float(self.AcquireTime.value))
                     self._camera.start_acquisition()
                 except Exception as exc:
+                    # DO NOT null out self._camera here. A transient
+                    # start_acquisition failure must not silently switch
+                    # the IOC to synthetic-frame mode for the rest of the
+                    # session (looks like a "parasite simulator" to users
+                    # downstream — fake data written to HDF5 looks real).
                     logger.error("Failed to start acquisition: %s", exc)
-                    self._camera = None
+                    self._acquiring = False
+                    self._publish(self.AcquireBusy, 0)
+                    self._publish(self.Acquire, 0)
+                    return
 
             self._publish(self.AcquireBusy, 1)
 
@@ -304,18 +312,18 @@ class CamPlugin(PVGroup):
                 if target > 0 and self._frame_counter >= target:
                     break
 
-                if self._camera:
-                    try:
-                        frame = self._camera.acquire_frame(timeout_ms=5000)
-                    except Exception as exc:
-                        logger.warning("Frame acquisition failed: %s", exc)
-                        continue
-                else:
-                    # Simulation fallback
-                    time.sleep(float(self.AcquireTime.value))
-                    w = int(self.SizeX_RBV.value)
-                    h = int(self.SizeY_RBV.value)
-                    frame = np.random.randint(0, 1000, (h, w), dtype=np.uint16)
+                if self._camera is None:
+                    # No camera bound. Bail out — do NOT synthesize frames.
+                    # If you want simulator behavior, run with
+                    # `--camera simulator`, which provides a real
+                    # SimulatorCamera instance.
+                    logger.error("No camera bound; aborting acquisition loop")
+                    break
+                try:
+                    frame = self._camera.acquire_frame(timeout_ms=5000)
+                except Exception as exc:
+                    logger.warning("Frame acquisition failed: %s", exc)
+                    continue
 
                 if frame is None:
                     continue

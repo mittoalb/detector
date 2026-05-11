@@ -141,8 +141,6 @@ class HDF5Plugin(PVGroup):
 
     @Capture.putter
     async def Capture(self, instance, value):
-        logger.info("HDF1:Capture putter received value=%r (was capturing=%s)",
-                     value, self._capturing)
         if value in (1, "Capture") and not self._capturing:
             self._start_capture()
             return 1
@@ -345,29 +343,25 @@ class HDF5Plugin(PVGroup):
         frames coming (e.g. tomoscan flats → projections → darks)."""
         try:
             num_capture = int(self.NumCapture.value)
-        except Exception as exc:
-            logger.warning("_maybe_stop_capture: NumCapture read failed (%s); "
-                            "treating as 0", exc)
+        except Exception:
             num_capture = 0
-        logger.info("_maybe_stop_capture: capturing=%s frames=%d num_capture=%d",
-                     self._capturing, self._frames_captured, num_capture)
         if not self._capturing:
-            return  # already stopped
+            return
         if num_capture > 0 and self._frames_captured >= num_capture:
-            logger.info("HDF5: capture target reached (%d >= %d), closing file",
+            logger.info("HDF5: capture target reached (%d/%d), closing file",
                          self._frames_captured, num_capture)
             self._stop_capture()
         else:
-            logger.info("HDF5: acquisition phase ended (%d/%d frames). "
-                         "Keeping file open for next phase.",
-                         self._frames_captured, num_capture)
+            logger.debug("HDF5: phase ended (%d/%d frames). Keeping file open.",
+                          self._frames_captured, num_capture)
 
     def _stop_capture(self):
-        import traceback
-        logger.info("_stop_capture called (frames=%d). Stack:\n%s",
-                     self._frames_captured,
-                     "".join(traceback.format_stack(limit=6)))
         self._capturing = False
+        # Fire monitor on Capture_RBV — tomoscan's end_scan does
+        # wait_pv(FPCaptureRBV, 0) right after putting Capture=Done.
+        # Writing _data["value"] directly does NOT notify subscribers,
+        # so we publish via the async loop.
+        self._publish(self.Capture_RBV, 0)
         self.Capture_RBV._data["value"] = 0
         self._publish(self.WriteMessage, "Idle")
 
