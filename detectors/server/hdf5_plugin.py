@@ -81,7 +81,14 @@ class HDF5Plugin(PVGroup):
                           enum_strings=["Done", "Capture"])
     Capture_RBV = pvproperty(value="Done", dtype=ChannelType.ENUM,
                               enum_strings=["Done", "Capture"], read_only=True)
-    WriteStatus = pvproperty(value="Idle", dtype=str, max_length=40, read_only=True)
+    # Standard areaDetector convention: WriteStatus is an enum (0=Success,
+    # 1=Failure). Tomoscan watches this for write errors with `value == 1`.
+    # Human-readable status goes in WriteMessage.
+    WriteStatus = pvproperty(value="Success", dtype=ChannelType.ENUM,
+                              enum_strings=["Success", "Failure"],
+                              read_only=True)
+    WriteMessage = pvproperty(value="Idle", dtype=str, max_length=80,
+                               read_only=True)
     XMLFileName = pvproperty(value="", dtype=str, max_length=256)
 
     def __init__(self, *args, **kwargs):
@@ -257,6 +264,8 @@ class HDF5Plugin(PVGroup):
                         return
                 except Exception as exc:
                     logger.error("HDF5 write error: %s", exc)
+                    self._publish(self.WriteStatus, 1)  # Failure
+                    self._publish(self.WriteMessage, f"Error: {exc}"[:80])
 
     def _start_capture(self):
         try:
@@ -270,19 +279,35 @@ class HDF5Plugin(PVGroup):
             file_name = _to_str(self.FileName.value)
             file_num = int(self.FileNumber.value)
             template = _to_str(self.FileTemplate.value)
-            logger.info("HDF5 start: path='%s' name='%s' num=%d",
-                         file_path, file_name, file_num)
-
-            try:
-                full_name = template % (file_path + "/", file_name, file_num)
-            except Exception:
-                full_name = f"{file_path}/{file_name}_{file_num:04d}.h5"
+            auto_inc = _to_str(self.AutoIncrement.value) == "Yes"
+            logger.info("HDF5 start: path='%s' name='%s' num=%d auto_inc=%s",
+                         file_path, file_name, file_num, auto_inc)
 
             try:
                 Path(file_path).mkdir(parents=True, exist_ok=True)
             except Exception as exc:
                 logger.error("Cannot create dir %s: %s", file_path, exc)
                 return
+
+            def _format_name(n: int) -> str:
+                try:
+                    return template % (file_path + "/", file_name, n)
+                except Exception:
+                    return f"{file_path}/{file_name}_{n:04d}.h5"
+
+            full_name = _format_name(file_num)
+            # areaDetector behavior: if AutoIncrement is on and the target
+            # file already exists, bump FileNumber until we find a free name.
+            # Prevents overwrites across IOC restarts (FileNumber resets to 1).
+            if auto_inc:
+                while os.path.exists(full_name):
+                    file_num += 1
+                    full_name = _format_name(file_num)
+                if file_num != int(self.FileNumber.value):
+                    self._publish(self.FileNumber, file_num)
+                    self.FileNumber._data["value"] = file_num
+                    logger.info("HDF5: skipped existing files, using num=%d",
+                                file_num)
 
             try:
                 self._h5_file = h5py.File(full_name, "w", libver="latest")
@@ -296,7 +321,8 @@ class HDF5Plugin(PVGroup):
                 self._not_capturing_drops = 0
                 self._capturing = True
                 self._publish(self.Capture_RBV, 1)
-                self._publish(self.WriteStatus, "Capturing")
+                self._publish(self.WriteStatus, 0)  # Success
+                self._publish(self.WriteMessage, "Capturing")
                 self._publish(self.FullFileName_RBV, full_name)
                 self._publish(self.NumCaptured_RBV, 0)
                 # Also poke the underlying values so synchronous reads work
@@ -329,7 +355,7 @@ class HDF5Plugin(PVGroup):
     def _stop_capture(self):
         self._capturing = False
         self.Capture_RBV._data["value"] = 0
-        self.WriteStatus._data["value"] = "Idle"
+        self._publish(self.WriteMessage, "Idle")
 
         # Drain queue and stop writer thread first (outside the lock,
         # since writer needs the lock to drain remaining items)
@@ -364,5 +390,7 @@ class HDF5Plugin(PVGroup):
                     self._h5_file = None
                     self._h5_dataset = None
 
-        if str(self.AutoIncrement.value) == "Yes":
-            self.FileNumber._data["value"] = int(self.FileNumber.value) + 1
+        if _to_str(self.AutoIncrement.value) == "Yes":
+            next_num = int(self.FileNumber.value) + 1
+            self._publish(self.FileNumber, next_num)
+            self.FileNumber._data["value"] = next_num

@@ -260,6 +260,12 @@ class CamPlugin(PVGroup):
             return
         self._acquiring = True
         self._frame_counter = 0
+        # Publish counters as 0 immediately. Otherwise NumImagesCounter_RBV
+        # carries the previous phase's value (e.g. "20/721" right after a
+        # 20-frame flat-field collection) until the first new frame arrives,
+        # which confuses tomoscan's per-phase progress readback.
+        self._publish(self.NumImagesCounter_RBV, 0)
+        self._publish(self.ArrayCounter_RBV, 0)
         self._acq_thread = threading.Thread(
             target=self._acquisition_loop, daemon=True)
         self._acq_thread.start()
