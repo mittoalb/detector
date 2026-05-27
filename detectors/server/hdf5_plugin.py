@@ -12,6 +12,15 @@ import time
 from pathlib import Path
 from typing import Optional
 
+# Disable HDF5's POSIX file locking BEFORE h5py imports the libhdf5 it
+# delegates to. HDF5 1.10+ takes an exclusive POSIX advisory lock on every
+# write-opened file; on NFS that lock leaks past h5py.File.close() and
+# remains until *this process* exits, so external viewers / h5dump report
+# the file as locked while the IOC keeps running. Only the IOC writes
+# these files, so the lock buys us nothing and we turn it off. Must be
+# set before libhdf5 loads — hence module-import time, not _start_capture.
+os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
+
 import numpy as np
 
 from caproto import ChannelType
@@ -399,7 +408,17 @@ class HDF5Plugin(PVGroup):
                                 file_num)
 
             try:
-                self._h5_file = h5py.File(full_name, "w", libver="latest")
+                # locking=False (h5py 3.5+) explicitly disables the POSIX
+                # advisory lock on this file. Belt-and-suspenders with the
+                # HDF5_USE_FILE_LOCKING env var set at module import.
+                # Older h5py raises on the locking kwarg → fall back.
+                try:
+                    self._h5_file = h5py.File(full_name, "w",
+                                               libver="latest",
+                                               locking=False)
+                except TypeError:
+                    self._h5_file = h5py.File(full_name, "w",
+                                               libver="latest")
                 # Datasets, queue, and writer thread are created lazily on
                 # the first frame of each FrameType.
                 self._h5_datasets = {}
