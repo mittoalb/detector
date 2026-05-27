@@ -320,10 +320,18 @@ class DetectorGui(QtWidgets.QMainWindow):
 
         right_layout.addWidget(status_box)
 
-        # HDF5 file save panel
-        save_box = QtWidgets.QGroupBox("HDF5 File Save")
+        # File save panel — switches between HDF5 and TIFF series writers
+        save_box = QtWidgets.QGroupBox("File Save")
         save_form = QtWidgets.QFormLayout(save_box)
         save_form.setLabelAlignment(QtCore.Qt.AlignRight)
+
+        # Output format selector — routes to ioc.HDF1 or ioc.TIF1
+        self.save_format_combo = QtWidgets.QComboBox()
+        self.save_format_combo.addItems(["HDF5", "TIFF series"])
+        self.save_format_combo.setToolTip(
+            "HDF5: single .h5 file with /exchange/data dataset (tomoscan-compatible)\n"
+            "TIFF series: one .tif file per frame (no tomoscan integration)")
+        save_form.addRow("Format:", self.save_format_combo)
 
         path_row = QtWidgets.QHBoxLayout()
         self.save_path_edit = QtWidgets.QLineEdit()
@@ -517,24 +525,30 @@ class DetectorGui(QtWidgets.QMainWindow):
                 except Exception:
                     pass
 
-        # HDF5 capture status
+        # File save status — pulled from whichever writer is currently
+        # selected in the Format combo. Both plugins expose the same
+        # attribute/PV names, so this code is format-agnostic.
         try:
-            hdf = self.ioc.HDF1
-            if hdf._capturing:
+            writer = self._active_writer()
+            if writer._capturing:
                 self.save_status_label.setText("Capturing")
                 self.capture_btn.setText("Stop Capture")
+                # Don't let the user swap formats mid-capture — that would
+                # leave the other plugin idle while frames stream into it.
+                self.save_format_combo.setEnabled(False)
             else:
                 self.save_status_label.setText("Idle")
                 self.capture_btn.setText("Start Capture")
-            recv = getattr(hdf, "_frames_received", 0)
+                self.save_format_combo.setEnabled(True)
+            recv = getattr(writer, "_frames_received", 0)
             self.save_received_label.setText(str(recv))
-            self.save_captured_label.setText(str(hdf._frames_captured))
+            self.save_captured_label.setText(str(writer._frames_captured))
             # Writer thread state — direct read from the plugin attribute
             # rather than going through the PV, so it stays responsive.
-            q = hdf._write_queue
+            q = writer._write_queue
             depth = q.qsize() if q is not None else 0
             qmax = q.maxsize if q is not None else 0
-            fbytes = getattr(hdf, "_frame_bytes", 0)
+            fbytes = getattr(writer, "_frame_bytes", 0)
             if qmax and fbytes:
                 used_mb = depth * fbytes / 1e6
                 cap_mb = qmax * fbytes / 1e6
@@ -548,7 +562,7 @@ class DetectorGui(QtWidgets.QMainWindow):
             else:
                 self.save_buffer_label.setText("0 MB")
             # Drops only show up in the log otherwise — surface them inline.
-            drops = getattr(hdf, "_dropped_frames", 0)
+            drops = getattr(writer, "_dropped_frames", 0)
             if drops:
                 cur = self.save_buffer_label.text()
                 self.save_buffer_label.setText(f"{cur}   dropped: {drops}")
@@ -556,14 +570,14 @@ class DetectorGui(QtWidgets.QMainWindow):
             # queue empty + not capturing = Idle, queue empty + capturing = Waiting
             if depth > 0:
                 state = "Writing"
-            elif hdf._capturing:
+            elif writer._capturing:
                 state = "Waiting for frames"
             else:
                 state = "Idle"
             self.save_writer_label.setText(state)
             # Update file number from plugin (auto-increments)
             self.save_number_edit.setText(
-                str(int(hdf.FileNumber._data["value"])))
+                str(int(writer.FileNumber._data["value"])))
         except Exception:
             pass
 
@@ -702,6 +716,17 @@ class DetectorGui(QtWidgets.QMainWindow):
             self.ioc.cam1._stop_acquisition()
             self._measured_fps = 0.0
             self._log("Acquisition stopped")
+            # GUI semantics: stopping the camera also closes the file. The
+            # plugin's _maybe_stop_capture (called from end_callback) only
+            # closes when NumCapture is hit, since tomoscan needs the file
+            # to stay open across multiple phases. For GUI-driven single
+            # captures, "Stop" means "save what we have", so force-close
+            # regardless of target. Safe even when not capturing — the
+            # plugin's _stop_capture early-returns on a closed session.
+            writer = self._active_writer()
+            if writer._capturing:
+                writer._stop_capture()
+                self._log(f"File saved ({writer._frames_captured} frames)")
         except Exception as exc:
             self._log(f"Stop failed: {exc}")
 
@@ -742,8 +767,17 @@ class DetectorGui(QtWidgets.QMainWindow):
         else:
             self._start_capture()
 
+    def _active_writer(self):
+        """Return the plugin (HDF5 or TIFF) corresponding to the current
+        Format combo selection. Both plugins expose the same PV surface,
+        so callers can use the result interchangeably."""
+        if (hasattr(self, "save_format_combo")
+                and self.save_format_combo.currentText() == "TIFF series"):
+            return self.ioc.TIF1
+        return self.ioc.HDF1
+
     def _start_capture(self):
-        hdf = self.ioc.HDF1
+        writer = self._active_writer()
         try:
             path = self.save_path_edit.text().strip()
             name = self.save_name_edit.text().strip() or "scan"
@@ -760,18 +794,19 @@ class DetectorGui(QtWidgets.QMainWindow):
             import os
             os.makedirs(path, exist_ok=True)
 
-            # Push to HDF5 plugin's PVs
-            hdf.FilePath._data["value"] = path
-            hdf.FilePath_RBV._data["value"] = path
-            hdf.FilePathExists_RBV._data["value"] = 1
-            hdf.FileName._data["value"] = name
-            hdf.FileName_RBV._data["value"] = name
-            hdf.FileNumber._data["value"] = number
-            hdf.NumCapture._data["value"] = num
+            # Push to the active writer's PVs (same names for both plugins)
+            writer.FilePath._data["value"] = path
+            writer.FilePath_RBV._data["value"] = path
+            writer.FilePathExists_RBV._data["value"] = 1
+            writer.FileName._data["value"] = name
+            writer.FileName_RBV._data["value"] = name
+            writer.FileNumber._data["value"] = number
+            writer.NumCapture._data["value"] = num
 
-            hdf._start_capture()
-            full = str(hdf.FullFileName_RBV._data["value"])
-            self._log(f"Capturing {num} frames to {full}")
+            writer._start_capture()
+            full = str(writer.FullFileName_RBV._data["value"])
+            fmt = self.save_format_combo.currentText()
+            self._log(f"Capturing {num} frames to {full} ({fmt})")
 
             # Optionally start acquisition if not already running
             if not self.ioc.cam1._acquiring:
@@ -788,9 +823,10 @@ class DetectorGui(QtWidgets.QMainWindow):
             self._log(f"Capture start failed: {exc}")
 
     def _stop_capture(self):
+        writer = self._active_writer()
         try:
-            self.ioc.HDF1._stop_capture()
-            captured = self.ioc.HDF1._frames_captured
+            writer._stop_capture()
+            captured = writer._frames_captured
             self._log(f"Capture stopped ({captured} frames written)")
         except Exception as exc:
             self._log(f"Stop capture failed: {exc}")

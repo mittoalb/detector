@@ -11,6 +11,7 @@ from detectors.core.base import BaseCamera
 from detectors.server.cam_plugin import CamPlugin
 from detectors.server.hdf5_plugin import HDF5Plugin
 from detectors.server.ntnda_server import NTNDArrayServer
+from detectors.server.tiff_plugin import TIFFPlugin
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,7 @@ class DetectorIOC(PVGroup):
 
     cam1 = SubGroup(CamPlugin, prefix="cam1:")
     HDF1 = SubGroup(HDF5Plugin, prefix="HDF1:")
+    TIF1 = SubGroup(TIFFPlugin, prefix="TIF1:")
 
     def __init__(self, *args,
                  camera: Optional[BaseCamera] = None,
@@ -47,6 +49,12 @@ class DetectorIOC(PVGroup):
         # acquisitions (flats / projections / darks), so we must not
         # auto-close between phases.
         self.cam1.register_end_callback(self.HDF1._maybe_stop_capture)
+        # TIFF series writer runs in parallel with HDF5. Its on_frame
+        # early-returns when not capturing, so wiring it unconditionally
+        # is free — only one writer ever has _capturing=True at a time
+        # (GUI enforces this with its format selector).
+        self.cam1.register_frame_callback(self.TIF1.on_frame)
+        self.cam1.register_end_callback(self.TIF1._maybe_stop_capture)
 
         # PVA NTNDArray server
         prefix = self.prefix if hasattr(self, "prefix") else ""

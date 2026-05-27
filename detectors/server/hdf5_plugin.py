@@ -161,6 +161,9 @@ class HDF5Plugin(PVGroup):
         # Diagnostic: count callback hits that were silently dropped because
         # capture wasn't active. Helps catch logic bugs that lose frames.
         self._not_capturing_drops = 0
+        # Gates the "frame arrived while not capturing" warning so an
+        # idle plugin (other format is selected) doesn't spam the log.
+        self._ever_started = False
 
     @NumCaptured_RBV.startup
     async def NumCaptured_RBV(self, instance, async_lib):
@@ -232,11 +235,16 @@ class HDF5Plugin(PVGroup):
     def on_frame(self, frame: np.ndarray, metadata: dict) -> None:
         """Frame callback — non-blocking enqueue to background writer."""
         if not self._capturing:
-            self._not_capturing_drops += 1
-            if self._not_capturing_drops % 25 == 1:
-                logger.warning(
-                    "HDF5: frame arrived while not capturing (count=%d, h5_open=%s)",
-                    self._not_capturing_drops, self._h5_file is not None)
+            # Only warn if this plugin has actually been used at least once
+            # in this session. A fresh IOC + camera-only streaming (user
+            # selected the *other* format) is not a bug, just an idle
+            # plugin getting frames it doesn't want.
+            if self._ever_started:
+                self._not_capturing_drops += 1
+                if self._not_capturing_drops % 25 == 1:
+                    logger.warning(
+                        "HDF5: frame arrived while not capturing (count=%d, h5_open=%s)",
+                        self._not_capturing_drops, self._h5_file is not None)
             return
 
         # Size the queue based on available RAM and the actual frame bytes.
@@ -446,6 +454,7 @@ class HDF5Plugin(PVGroup):
                 self._dropped_frames = 0
                 self._not_capturing_drops = 0
                 self._capturing = True
+                self._ever_started = True
                 self._publish(self.Capture_RBV, 1)
                 self._publish(self.WriteStatus, 0)  # Success
                 self._publish(self.WriteMessage, "Capturing")
@@ -517,6 +526,13 @@ class HDF5Plugin(PVGroup):
 
     def _stop_capture(self):
         self._capturing = False
+        # Clear _ever_started so the post-stop frames that always trail
+        # an active camera don't spam "frame arrived while not capturing"
+        # forever. The warning is only useful during the brief window
+        # between target-hit and camera-stop, where it catches data loss.
+        # Once we've cleanly stopped, the plugin is idle and silent —
+        # selecting a different format (TIFF vs HDF5) won't trigger it.
+        self._ever_started = False
         # Fire monitor on Capture_RBV — tomoscan's end_scan does
         # wait_pv(FPCaptureRBV, 0) right after putting Capture=Done.
         # Writing _data["value"] directly does NOT notify subscribers,
