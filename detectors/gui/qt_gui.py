@@ -490,18 +490,21 @@ class DetectorGui(QtWidgets.QMainWindow):
                     self._set_widget_value(self.controls[key], val)
                 except Exception:
                     pass
-        # Sensor temperature / cooler status from camera
-        for key in ("SensorTemperature", "SensorCoolerStatus"):
+        # Sensor temperature / cooler status / frame rate from camera API.
+        # AcquisitionFrameRate is aliased to DCAM InternalFrameRate
+        # (camera's achievable rate given current exposure/binning/ROI),
+        # which is meaningful even when not acquiring.
+        for key in ("SensorTemperature", "SensorCoolerStatus",
+                    "AcquisitionFrameRate"):
             if key in self.status_labels:
                 try:
                     val = self.camera.get_param(key)
-                    self.status_labels[key].setText(str(val))
+                    if isinstance(val, float):
+                        self.status_labels[key].setText(f"{val:.2f}")
+                    else:
+                        self.status_labels[key].setText(str(val))
                 except Exception:
                     pass
-        # Measured FPS (from frame callback timing, not camera property)
-        if "AcquisitionFrameRate" in self.status_labels:
-            self.status_labels["AcquisitionFrameRate"].setText(
-                f"{self._measured_fps:.1f}")
 
         # HDF5 capture status
         try:

@@ -90,13 +90,13 @@ def main():
         logger.info("Auto-detecting camera...")
         camera = registry.auto_detect()
         if camera is None:
-            logger.warning("No camera detected — running in simulation mode")
-            try:
-                camera = registry.create("simulator", device_index=args.device_index)
-                camera.open()
-            except Exception as exc:
-                logger.error("Cannot start simulator: %s", exc)
-                sys.exit(1)
+            logger.error(
+                "No real camera detected. Refusing to silently fall back to "
+                "the simulator — that has caused fake data to be written to "
+                "HDF5 in the past. If you actually want the simulator, run "
+                "with `--camera simulator`. To see why auto-detect failed, "
+                "rerun with `--log-level DEBUG`.")
+            sys.exit(2)
 
     # Build IOC
     from detectors.server.ioc import DetectorIOC

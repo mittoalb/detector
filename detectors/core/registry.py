@@ -61,7 +61,10 @@ def auto_detect(camera_types: Optional[List[str]] = None) -> Optional[BaseCamera
         First successfully-opened camera, or None if all fail.
     """
     types = camera_types if camera_types is not None else list_types()
-    for ct in types:
+    # Never silently pick the simulator during auto-detect; if no real camera
+    # comes up, the caller should report failure rather than fake data.
+    real_types = [ct for ct in types if ct != "simulator"]
+    for ct in real_types:
         try:
             cls = get_class(ct)
             cam = cls()
@@ -69,7 +72,10 @@ def auto_detect(camera_types: Optional[List[str]] = None) -> Optional[BaseCamera
             logger.info("Auto-detected camera: %s", ct)
             return cam
         except Exception as exc:
-            logger.debug("  %s: %s", ct, exc)
+            # Promote to INFO so the user sees *why* each backend failed —
+            # the most common cause after a reboot is the vendor SDK / driver
+            # not being loaded, and silent DEBUG hides it.
+            logger.info("  auto-detect %s failed: %s", ct, exc)
     return None
 
 
