@@ -355,8 +355,18 @@ class DetectorGui(QtWidgets.QMainWindow):
         self.save_status_label = QtWidgets.QLabel("Idle")
         save_form.addRow("Status:", self.save_status_label)
 
+        # Received: frames handed from camera to HDF5 plugin.
+        # Captured: frames actually committed to disk.
+        # Gap between them = how far the writer is behind = how saturated
+        # the in-RAM buffer is (also shown explicitly as Buffer below).
+        self.save_received_label = QtWidgets.QLabel("0")
+        save_form.addRow("Received:", self.save_received_label)
         self.save_captured_label = QtWidgets.QLabel("0")
         save_form.addRow("Captured:", self.save_captured_label)
+        self.save_writer_label = QtWidgets.QLabel("Idle")
+        save_form.addRow("Writer:", self.save_writer_label)
+        self.save_buffer_label = QtWidgets.QLabel("0 / 0")
+        save_form.addRow("Buffer:", self.save_buffer_label)
 
         save_btn_row = QtWidgets.QHBoxLayout()
         self.capture_btn = QtWidgets.QPushButton("Start Capture")
@@ -515,7 +525,41 @@ class DetectorGui(QtWidgets.QMainWindow):
             else:
                 self.save_status_label.setText("Idle")
                 self.capture_btn.setText("Start Capture")
+            recv = getattr(hdf, "_frames_received", 0)
+            self.save_received_label.setText(str(recv))
             self.save_captured_label.setText(str(hdf._frames_captured))
+            # Writer thread state — direct read from the plugin attribute
+            # rather than going through the PV, so it stays responsive.
+            q = hdf._write_queue
+            depth = q.qsize() if q is not None else 0
+            qmax = q.maxsize if q is not None else 0
+            fbytes = getattr(hdf, "_frame_bytes", 0)
+            if qmax and fbytes:
+                used_mb = depth * fbytes / 1e6
+                cap_mb = qmax * fbytes / 1e6
+                pct = 100.0 * depth / qmax
+                self.save_buffer_label.setText(
+                    f"{used_mb:,.0f} / {cap_mb:,.0f} MB  ({pct:4.1f}%)")
+            elif qmax:
+                pct = 100.0 * depth / qmax
+                self.save_buffer_label.setText(
+                    f"{depth} / {qmax} frames  ({pct:4.1f}%)")
+            else:
+                self.save_buffer_label.setText("0 MB")
+            # Drops only show up in the log otherwise — surface them inline.
+            drops = getattr(hdf, "_dropped_frames", 0)
+            if drops:
+                cur = self.save_buffer_label.text()
+                self.save_buffer_label.setText(f"{cur}   dropped: {drops}")
+            # Infer state without polling the PV: queue draining = Writing,
+            # queue empty + not capturing = Idle, queue empty + capturing = Waiting
+            if depth > 0:
+                state = "Writing"
+            elif hdf._capturing:
+                state = "Waiting for frames"
+            else:
+                state = "Idle"
+            self.save_writer_label.setText(state)
             # Update file number from plugin (auto-increments)
             self.save_number_edit.setText(
                 str(int(hdf.FileNumber._data["value"])))
@@ -616,28 +660,35 @@ class DetectorGui(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+    def _force_internal_trigger(self):
+        """Switch the camera to Internal trigger / TriggerMode=Off.
+
+        The hardware default is External (set in orca_fire_dcam.open() so
+        tomoscan-driven scans work out of the box). For GUI-driven runs
+        — both "Start" and "Start Capture" — we want free-running, so we
+        override it here. Tomoscan re-sets External itself when it takes
+        over, so this doesn't leak.
+        """
+        if self.camera:
+            for prop, val in (("TriggerMode", "Off"),
+                              ("TriggerSource", "Internal")):
+                try:
+                    self.camera.set_param(prop, val)
+                except Exception:
+                    pass
+        self.ioc.cam1.TriggerMode._data["value"] = "Off"
+        self.ioc.cam1.TriggerMode_RBV._data["value"] = "Off"
+        self.ioc.cam1.TriggerSource._data["value"] = "Internal"
+
     def _start_acquisition(self):
         try:
             self._fps_count = 0
             self._fps_last_t = 0.0
             self._measured_fps = 0.0
-            # Force a clean free-running state regardless of any external
-            # trigger config left over from previous use (e.g. tomoscan).
-            if self.camera:
-                try:
-                    self.camera.set_param("TriggerMode", "Off")
-                except Exception:
-                    pass
-                try:
-                    self.camera.set_param("TriggerSource", "Internal")
-                except Exception:
-                    pass
+            self._force_internal_trigger()
             # Free-running until user clicks Stop
             self.ioc.cam1.ImageMode._data["value"] = "Continuous"
             self.ioc.cam1.NumImages._data["value"] = 0
-            self.ioc.cam1.TriggerMode._data["value"] = "Off"
-            self.ioc.cam1.TriggerMode_RBV._data["value"] = "Off"
-            self.ioc.cam1.TriggerSource._data["value"] = "Internal"
             self.ioc.cam1._start_acquisition()
             # Refresh widget values
             self._populate_values()
@@ -723,6 +774,9 @@ class DetectorGui(QtWidgets.QMainWindow):
 
             # Optionally start acquisition if not already running
             if not self.ioc.cam1._acquiring:
+                # Force Internal trigger — the hardware default is External
+                # (for tomoscan); GUI-driven captures need to free-run.
+                self._force_internal_trigger()
                 # Set image mode to Multiple with NumImages = num
                 self.ioc.cam1.ImageMode._data["value"] = "Multiple"
                 self.ioc.cam1.NumImages._data["value"] = num

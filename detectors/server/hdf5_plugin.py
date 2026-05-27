@@ -8,6 +8,7 @@ import logging
 import os
 import queue
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -99,6 +100,20 @@ class HDF5Plugin(PVGroup):
     WriteMessage = pvproperty(value="Idle", dtype=str, max_length=80,
                                read_only=True)
     XMLFileName = pvproperty(value="", dtype=str, max_length=256)
+    # Live buffer / writer telemetry. The writer thread runs behind a
+    # bounded queue; if the disk can't keep up these reveal the backlog
+    # before frames start dropping.
+    #   NumReceived_RBV    — frames handed to on_frame (camera-side count)
+    #   QueueDepth_RBV     — frames currently waiting to be written
+    #   QueueMax_RBV       — queue capacity (sized from RAM at capture start)
+    #   WriterState_RBV    — Idle / Writing / Closing / Error
+    NumReceived_RBV = pvproperty(value=0, dtype=int, read_only=True)
+    QueueDepth_RBV = pvproperty(value=0, dtype=int, read_only=True)
+    QueueMax_RBV = pvproperty(value=0, dtype=int, read_only=True)
+    WriterState_RBV = pvproperty(value="Idle", dtype=ChannelType.ENUM,
+                                  enum_strings=["Idle", "Writing",
+                                                "Closing", "Error"],
+                                  read_only=True)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -122,8 +137,12 @@ class HDF5Plugin(PVGroup):
         self._write_queue: Optional[queue.Queue] = None
         self._write_thread: Optional[threading.Thread] = None
         # Queue size is computed from available RAM at capture-start time.
-        # Use up to RAM_BUDGET_FRAC of free system memory.
-        self._ram_budget_frac = 0.25
+        # Use up to RAM_BUDGET_FRAC of free system memory. 0.75 leaves
+        # 25% headroom for the OS page cache (which speeds NFS writes),
+        # h5py's internal buffers, and a margin against OOM if another
+        # process spikes — but lets a dedicated-capture box buffer most
+        # of a long burst in RAM before NFS becomes the bottleneck.
+        self._ram_budget_frac = 0.75
         self._dropped_frames = 0
         # Async loop reference for thread-safe PV publishes (set in startup).
         self._async_loop = None
@@ -215,10 +234,13 @@ class HDF5Plugin(PVGroup):
             frame_bytes = int(frame.nbytes)
             qsize = _compute_queue_size(frame_bytes, self._ram_budget_frac)
             self._write_queue = queue.Queue(maxsize=qsize)
+            self._frame_bytes = frame_bytes  # stored so GUI can show MB, not slots
             free_mb = _free_ram_bytes() / 1e6
             logger.info(
                 "HDF5 queue: %d frames (%.0f MB / frame, %.0f MB free RAM)",
                 qsize, frame_bytes / 1e6, free_mb)
+            # Publish queue capacity so GUI can show "buffer fill" as a fraction.
+            self._publish(self.QueueMax_RBV, qsize)
 
         # Writer thread watchdog: if missing or died, (re)start it.
         # Tomoscan keeps one capture session across flats / projections /
@@ -239,8 +261,14 @@ class HDF5Plugin(PVGroup):
         # /exchange dataset.
         frame_type = metadata.get("frame_type", "Projection") if metadata else "Projection"
         item = (frame_type, np.ascontiguousarray(frame))
+        # Camera-side counter: increments on every received frame, regardless
+        # of whether the writer ultimately accepts or drops it. Together with
+        # NumCaptured_RBV this exposes the receive-vs-write gap.
+        self._frames_received = getattr(self, "_frames_received", 0) + 1
+        self._publish(self.NumReceived_RBV, self._frames_received)
         try:
             self._write_queue.put_nowait(item)
+            self._publish(self.QueueDepth_RBV, self._write_queue.qsize())
         except queue.Full:
             # Writer can't keep up — drop this frame
             self._dropped_frames += 1
@@ -261,13 +289,20 @@ class HDF5Plugin(PVGroup):
             try:
                 item = self._write_queue.get(timeout=0.5)
             except queue.Empty:
+                # Idle: nothing in the queue right now.
+                self._publish(self.WriterState_RBV, 0)  # Idle
+                self._publish(self.QueueDepth_RBV, 0)
                 # File closed out from under us → no more work to do.
                 if self._h5_file is None:
                     return
                 continue
             if item is None:
                 # Sentinel from _stop_capture — flush and exit.
+                self._publish(self.WriterState_RBV, 2)  # Closing
                 return
+            # Got an item → actively writing.
+            self._publish(self.WriterState_RBV, 1)  # Writing
+            self._publish(self.QueueDepth_RBV, self._write_queue.qsize())
 
             with self._lock:
                 if self._h5_file is None:
@@ -319,6 +354,7 @@ class HDF5Plugin(PVGroup):
                     logger.error("HDF5 write error: %s", exc)
                     self._publish(self.WriteStatus, 1)  # Failure
                     self._publish(self.WriteMessage, f"Error: {exc}"[:80])
+                    self._publish(self.WriterState_RBV, 3)  # Error
 
     def _start_capture(self):
         try:
@@ -373,6 +409,7 @@ class HDF5Plugin(PVGroup):
                 self._write_queue = None
                 self._write_thread = None
                 self._frames_captured = 0
+                self._frames_received = 0
                 self._dropped_frames = 0
                 self._not_capturing_drops = 0
                 self._capturing = True
@@ -381,6 +418,9 @@ class HDF5Plugin(PVGroup):
                 self._publish(self.WriteMessage, "Capturing")
                 self._publish(self.FullFileName_RBV, full_name)
                 self._publish(self.NumCaptured_RBV, 0)
+                self._publish(self.NumReceived_RBV, 0)
+                self._publish(self.QueueDepth_RBV, 0)
+                self._publish(self.WriterState_RBV, 0)  # Idle
                 # Also poke the underlying values so synchronous reads work
                 self.FullFileName_RBV._data["value"] = full_name
                 logger.info("HDF5: capturing to %s", full_name)
@@ -407,6 +447,34 @@ class HDF5Plugin(PVGroup):
         else:
             logger.debug("HDF5: phase ended (%d/%d frames). Keeping file open.",
                           self._frames_captured, num_capture)
+
+    def _background_fsync(self, path):
+        """Drain NFS write-behind for `path` off the calling thread.
+
+        Run in a daemon thread so a slow flush never freezes the GUI or
+        blocks the caproto putter. Flips WriterState_RBV from Closing →
+        Idle and WriteMessage to a final summary when the bytes are
+        durable on the NFS server.
+        """
+        start = time.time()
+        try:
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            elapsed = time.time() - start
+            if elapsed > 0.5:
+                logger.info(
+                    "HDF5: fsync took %.1f s (NFS write-behind drain)",
+                    elapsed)
+            self._publish(self.WriteMessage,
+                           f"Saved (flushed in {elapsed:.1f}s)")
+        except Exception as exc:
+            logger.warning("HDF5: fsync failed: %s", exc)
+            self._publish(self.WriteMessage, f"Saved (fsync failed: {exc})"[:80])
+        finally:
+            self._publish(self.WriterState_RBV, 0)  # Idle
 
     def _stop_capture(self):
         self._capturing = False
@@ -456,7 +524,31 @@ class HDF5Plugin(PVGroup):
                         self._h5_file.create_dataset(
                             "/defaults/HDF5FrameLocation", data=loc_arr)
 
+                    # Capture the filename before closing — needed for the
+                    # post-close fsync that pushes NFS write-behind cache
+                    # out to the server.
+                    closed_path = self._h5_file.filename
                     self._h5_file.close()
+                    # NFS pathology: h5py.close() returns as soon as the
+                    # bytes are in the Linux page cache (marked dirty);
+                    # the kernel then drains them to the NFS server in
+                    # the background — and while that drains, every other
+                    # op on the same mount gets queued behind it. fsync()
+                    # blocks until bytes are durable on the server. For a
+                    # multi-GB file on NFS that can take many seconds, so
+                    # we do it in a background thread and let _stop_capture
+                    # return immediately — otherwise the Qt GUI (or the
+                    # caproto putter that called us) would freeze for the
+                    # whole flush. WriterState_RBV stays "Closing" until
+                    # the fsync completes; "Done" only fires after.
+                    self._publish(self.WriterState_RBV, 2)  # Closing
+                    self._publish(self.WriteMessage,
+                                   "Flushing to disk (NFS sync)…")
+                    threading.Thread(
+                        target=self._background_fsync,
+                        args=(closed_path,),
+                        daemon=True,
+                        name="hdf5-fsync").start()
                     counts_str = ", ".join(
                         f"{ftype}={c}"
                         for ftype, c in self._dataset_counts.items())
