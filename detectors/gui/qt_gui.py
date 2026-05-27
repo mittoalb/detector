@@ -347,9 +347,10 @@ class DetectorGui(QtWidgets.QMainWindow):
             str(int(self.ioc.HDF1.FileNumber._data["value"])))
         save_form.addRow("File number:", self.save_number_edit)
 
-        self.save_count_edit = QtWidgets.QLineEdit("100")
-        self.save_count_edit.setText(
-            str(int(self.ioc.HDF1.NumCapture._data["value"])))
+        # Don't seed from NumCapture._data — its pvproperty default of 1
+        # (now 1000) would silently auto-close the file after one frame
+        # if the user clicked Start Capture without changing it.
+        self.save_count_edit = QtWidgets.QLineEdit("1000")
         save_form.addRow("Frames to save:", self.save_count_edit)
 
         self.save_status_label = QtWidgets.QLabel("Idle")

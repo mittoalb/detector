@@ -94,7 +94,10 @@ class HDF5Plugin(PVGroup):
     AutoSave = pvproperty(value="Yes", dtype=str, max_length=40)
 
     FileWriteMode = pvproperty(value="Stream", dtype=str, max_length=40)
-    NumCapture = pvproperty(value=1, dtype=int)
+    # Default 1000 (not 1) so a freshly-started IOC doesn't silently close
+    # the file after a single frame when the user clicks "Start Capture"
+    # without first typing a count. 0 means "capture until Stop pressed".
+    NumCapture = pvproperty(value=1000, dtype=int)
     NumCaptured_RBV = pvproperty(value=0, dtype=int, read_only=True)
     Capture = pvproperty(value="Done", dtype=ChannelType.ENUM,
                           enum_strings=["Done", "Capture"])
@@ -351,19 +354,30 @@ class HDF5Plugin(PVGroup):
                                    self._frames_captured)
 
                     if num_capture > 0 and self._frames_captured >= num_capture:
-                        # Target reached. Mark not-capturing; the cam_plugin
-                        # end_callback path (_maybe_stop_capture) will close
-                        # the file. We can exit this thread cleanly.
+                        # Target reached. Close the file from here:
+                        # cam_plugin's end_callback (_maybe_stop_capture) fires
+                        # the moment the camera stops, which is *before* the
+                        # writer drains its queue — so by the time the writer
+                        # finally hits the target, end_callback is long gone
+                        # and there's no second trigger to close the file.
+                        # _stop_capture is safe to call from the writer thread:
+                        # the RLock makes its inner `with self._lock:` reentrant,
+                        # and it skips joining the writer thread when called
+                        # from that same thread.
                         logger.info(
-                            "writer_loop: target reached (%d >= %d), exiting",
+                            "writer_loop: target reached (%d >= %d), closing file",
                             self._frames_captured, num_capture)
                         self._capturing = False
+                        self._stop_capture()
                         return
                 except Exception as exc:
                     logger.error("HDF5 write error: %s", exc)
                     self._publish(self.WriteStatus, 1)  # Failure
                     self._publish(self.WriteMessage, f"Error: {exc}"[:80])
                     self._publish(self.WriterState_RBV, 3)  # Error
+                    # fall through to top of loop; do NOT close the file —
+                    # transient write errors shouldn't abort the session.
+                    continue
 
     def _start_capture(self):
         try:
@@ -452,13 +466,19 @@ class HDF5Plugin(PVGroup):
     def _maybe_stop_capture(self):
         """Called when acquisition ends. Only close HDF5 if the capture
         target was reached. Otherwise keep file open — there are more
-        frames coming (e.g. tomoscan flats → projections → darks)."""
+        frames coming (e.g. tomoscan flats → projections → darks).
+
+        Guard on _h5_file (the actual resource), not on _capturing —
+        the writer thread flips _capturing=False the moment it hits the
+        target so on_frame stops enqueuing, but the file is still open
+        at that point and needs us to close + fsync it.
+        """
         try:
             num_capture = int(self.NumCapture.value)
         except Exception:
             num_capture = 0
-        if not self._capturing:
-            return
+        if self._h5_file is None:
+            return  # already closed; nothing to do
         if num_capture > 0 and self._frames_captured >= num_capture:
             logger.info("HDF5: capture target reached (%d/%d), closing file",
                          self._frames_captured, num_capture)
