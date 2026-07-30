@@ -36,6 +36,7 @@ epics = [
 ]
 save = [
     "imageio>=2.19.0",
+    "tifffile>=2023.1.0",
 ]
 
 [project.scripts]

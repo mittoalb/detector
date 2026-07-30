@@ -1,248 +1,225 @@
-# ORCA Fire Detector Control
+# Multi-Camera Area Detector Control
 
-Hamamatsu ORCA Fire (C16240-20UP) camera control via Euresys Coaxlink Quad CXP-12
-frame grabber, using Harvesters/GenTL. No DCAM-SDK required. Includes a standalone
-Qt GUI, an areaDetector-compatible EPICS IOC for tomoscan, and PVAccess NTNDArray
-streaming for pystream.
+Camera-agnostic EPICS areaDetector IOC and Qt GUI for scientific cameras.
+Currently supports Hamamatsu, Teledyne, and Tucsen — adding new camera types
+is a single-file addition.
+
+## Supported Cameras
+
+| Backend | Camera | SDK |
+|---------|--------|-----|
+| `hamamatsu.orca_fire_dcam` | Hamamatsu ORCA Fire C16240-20UP | DCAM-API + Active Silicon FireBird |
+| `hamamatsu.orca_fire_gentl` | Hamamatsu ORCA Fire C16240-20UP | Harvesters/GenTL + Euresys Coaxlink |
+| `teledyne.oryx` | Teledyne FLIR Oryx (CXP) | Spinnaker SDK + PySpin |
+| `teledyne.kinetix` | Teledyne Photometrics Kinetix | PVCAM + PyVCAM |
+| `tucsen.libra_5514pro` | Tucsen Libra 5514 Pro | TUCAM SDK (skeleton) |
+| `simulator` | Synthetic frames | none — built in |
 
 ## Architecture
 
 ```
-tomoscan / EPICS clients ──► caproto IOC (cam1: + HDF1: PVs)
-                                │
-pystream ──────────────────► pvapy NTNDArray server (image1:ArrayData)
-                                │
-Qt GUI ────────────────────► IOCBackend adapter
-                                │
-                           OrcaFireAcquirer
-                                │
-                           Harvesters / GenTL
-                                │
-                           Euresys coaxlink.cti
-                                │
-                           Coaxlink Quad CXP-12 frame grabber
-                                │
-                           CoaXPress link (CXP-6 x4)
-                                │
-                           Hamamatsu ORCA Fire C16240-20UP
+                          run_ioc.py
+                              │
+                              ▼
+        ┌──────── DetectorIOC (PVGroup) ────────┐
+        │  cam1: PVs   HDF1: PVs   image1: PVA  │
+        └──────────────────┬────────────────────┘
+                           │ BaseCamera interface
+                           ▼
+       ┌───────────────────────────────────────┐
+       │   Camera Registry (auto/explicit)     │
+       └─────┬─────────┬─────────┬─────────┬───┘
+             ▼         ▼         ▼         ▼
+        Hamamatsu Teledyne   Tucsen   Simulator
+         DCAM    Spinnaker   TUCAM
+       (ORCA Fire) (Oryx)  (Libra 5514)
 ```
 
-## Setup
+The `BaseCamera` abstract class (`detectors/core/base.py`) defines a uniform
+interface — every backend implements `open`, `close`, `get_param`, `set_param`,
+`acquire_frame`, `start_acquisition`, `stop_acquisition`, etc.
+
+Backends self-register via the `@register` decorator. Adding a new camera is
+a single new file in `detectors/cameras/<vendor>/`.
+
+## Installation
+
+### Base requirements
 
 ```bash
 conda create -n detector python=3.11
 conda activate detector
-pip install numpy PyQt5 harvesters caproto h5py pvapy
-
-# Optional:
-pip install imageio   # TIFF export from GUI
-pip install pyqtgraph # GUI plotting
+pip install numpy PyQt5 caproto h5py pvapy
+pip install imageio  # optional, for TIFF export
 ```
 
-### Hardware requirements
+### Per-camera SDK requirements
 
-- **Frame grabber**: Euresys Coaxlink Quad CXP-12 (PCIe card)
-  - 6-pin PCIe auxiliary power cable MUST be connected
-  - eGrabber driver + GenTL producer installed at `/opt/euresys/egrabber/`
-  - Firmware must be current (run `coaxlink-firmware update` if status shows "TooOld")
-- **Camera**: Hamamatsu ORCA Fire C16240-20UP
-  - 4 CoaXPress cables connecting camera ports 1-4 to frame grabber ports A-D
-  - External power supply connected (camera does not use PoCXP)
-- **CXP cables**: CXP-12 rated cables recommended. CXP-6 cables work for data
-  transfer but the link stays in "Detected" state, which limits register write
-  access (trigger mode, binning via camera). Frame grabber FPGA binning and
-  exposure time control work regardless.
+| Backend | Install |
+|---------|---------|
+| `hamamatsu.orca_fire_dcam` | DCAM-API Lite for Linux + FireBird kernel driver. See `firebird-driver-rhel9-patch/README.md` |
+| `hamamatsu.orca_fire_gentl` | `pip install harvesters` + Euresys eGrabber |
+| `teledyne.oryx` | Spinnaker SDK + `pip install spinnaker-python` |
+| `teledyne.kinetix` | PVCAM + `pip install pyvcam` |
+| `tucsen.libra_5514pro` | TUCAM SDK from Tucsen |
 
 ## Running
 
-### EPICS IOC (headless, for tomoscan)
-
 ```bash
-python run_orca_ioc.py --prefix ORCA:
+# List available backends
+python run_ioc.py --list-cameras
+
+# Auto-detect
+python run_ioc.py --prefix MYDET:
+
+# Specify backend
+python run_ioc.py --camera hamamatsu.orca_fire_dcam --prefix ORCA:
+python run_ioc.py --camera teledyne.oryx --prefix ORYX:
+python run_ioc.py --camera simulator --prefix SIM:
+
+# With Qt GUI
+python run_ioc.py --camera simulator --gui
+
+# Show all served PVs
+python run_ioc.py --camera simulator --list-pvs
+
+# Custom PVA stream PV name
+python run_ioc.py --camera simulator --pva-pv MYDET:image:NTNDArray
 ```
 
-### EPICS IOC + Qt GUI
+## Adding a new camera
 
-```bash
-python run_orca_ioc.py --prefix ORCA: --gui
+1. Create `detectors/cameras/<vendor>/<model>.py` implementing `BaseCamera`:
+
+```python
+from detectors.core.base import BaseCamera, CameraInfo
+from detectors.core.registry import register
+
+@register
+class MyNewCamera(BaseCamera):
+    camera_type = "vendor.model"
+    display_name = "Vendor Model XYZ"
+
+    def open(self):
+        # Open camera via vendor SDK
+        self._info = CameraInfo(vendor="Vendor", model="XYZ", ...)
+
+    def close(self):
+        # Cleanup
+
+    def get_param(self, name):
+        # Read parameter
+
+    def set_param(self, name, value):
+        # Write parameter
+
+    def list_params(self):
+        return ["ExposureTime", "Width", "Height", ...]
+
+    def start_acquisition(self):
+        ...
+
+    def stop_acquisition(self):
+        ...
+
+    def acquire_frame(self, timeout_ms=5000):
+        # Return numpy array (height, width)
+        ...
 ```
 
-### Standalone Qt GUI (no EPICS)
+2. Add the module path to `detectors/core/registry.py:load_all()`.
 
-```bash
-python orca/qt_detector.py
-```
+That's it — the IOC, GUI, and tomoscan integration work without changes.
 
-### List all served PVs
+## Standard parameter names
 
-```bash
-python run_orca_ioc.py --list-pvs
-```
+Backends should use these names where applicable so the GUI/IOC are uniform
+across cameras:
+
+| Name | Type | Description |
+|------|------|-------------|
+| `ExposureTime` | float | Exposure in seconds |
+| `AcquisitionFrameRate` | float | Current frame rate (often read-only) |
+| `Width` / `Height` | int | Image dimensions |
+| `OffsetX` / `OffsetY` | int | ROI offset |
+| `BinningHorizontal` / `BinningVertical` | int | Binning factor |
+| `PixelFormat` | str | "Mono16", "Mono12", etc. |
+| `TriggerMode` | str | "Off", "On" |
+| `TriggerSource` | str | "Internal", "External", "Software" |
+| `TriggerActive` | str | "Edge", "Level" |
+| `TriggerPolarity` | str | "Positive", "Negative" |
+| `SensorMode` | str | "Area", "Lightsheet" |
+| `ReadoutSpeed` | str | "Fastest", "Slowest" |
+| `ShutterMode` | str | "Rolling", "Global" |
+| `SensorTemperature` | float | Celsius (read-only) |
+| `SensorCooler` | str | "Off", "On", "Max" |
+| `SensorCoolerStatus` | str | "Ready", "Busy", "Off", "Error" |
+| `SensorTemperatureTarget` | float | Cooler setpoint |
+
+Backends raise `KeyError` for unsupported parameters; the GUI hides them.
 
 ## EPICS PVs
 
-### cam1: PVs (areaDetector camera driver)
-
-| PV | Type | Description |
-|----|------|-------------|
-| `cam1:Acquire` | int | 1=start, 0=stop |
-| `cam1:AcquireTime` | float | Exposure time in seconds |
-| `cam1:AcquireTime_RBV` | float | Readback |
-| `cam1:ImageMode` | str | "Single", "Multiple", "Continuous" |
-| `cam1:NumImages` | int | Frames to acquire (Multiple mode) |
-| `cam1:NumImagesCounter_RBV` | int | Frames acquired so far |
-| `cam1:ArrayCounter_RBV` | int | Total frame counter |
-| `cam1:ArraySize0_RBV` | int | Image width (pixels) |
-| `cam1:ArraySize1_RBV` | int | Image height (pixels) |
-| `cam1:TriggerMode` | str | "Off" (free-run), "On" (external) |
-| `cam1:TriggerSoftware` | int | Write 1 to fire software trigger |
-| `cam1:BinX` / `cam1:BinY` | int | Binning factor (1, 2, or 4) |
-| `cam1:ArrayData` | int[] | Raw frame data (CA, flattened) |
-
-### HDF1: PVs (areaDetector HDF5 file writer)
-
-| PV | Type | Description |
-|----|------|-------------|
-| `HDF1:Capture` | int | 1=start capture, 0=stop |
-| `HDF1:FilePath` | str | Output directory |
-| `HDF1:FileName` | str | Base filename |
-| `HDF1:FileNumber` | int | Current file number |
-| `HDF1:NumCapture` | int | Frames to capture |
-| `HDF1:NumCaptured_RBV` | int | Frames written so far |
-| `HDF1:FullFileName_RBV` | str | Full path of current file |
-| `HDF1:FilePathExists_RBV` | int | 1 if output directory exists |
-
-HDF5 files are written with dataset `/exchange/data` of shape `(N, height, width)`, dtype `uint16`.
-
-### PVAccess (pystream)
-
-Frames are published as NTNDArray on:
-
-```
-ORCA:image1:ArrayData
-```
-
-Use with pystream:
-```bash
-python pyqtstream.py --pv ORCA:image1:ArrayData
-```
-
-Throttled to 30 fps for display. Full-speed acquisition continues independently.
+Standard areaDetector PVs are served under `<prefix>cam1:` and `<prefix>HDF1:`.
+Run `python run_ioc.py --camera <type> --list-pvs` to see all 65+ PVs.
 
 ## tomoscan integration
 
-### EPICS database substitutions
-
 ```
-CameraPVPrefix      = ORCA:
-FilePluginPVPrefix  = ORCA:HDF1:
+CameraPVPrefix      = <prefix>:
+FilePluginPVPrefix  = <prefix>:HDF1:
 ```
 
-### Step-scan workflow
+Step-scan and fly-scan workflows are supported. The HDF5 plugin writes frames
+to dataset `/exchange/data` with shape `(N, height, width)` uint16.
 
-tomoscan controls the camera through standard areaDetector PVs:
+## PVAccess streaming
 
-1. Set `cam1:ImageMode` = "Multiple"
-2. Set `cam1:NumImages` = N (number of projections)
-3. Set `cam1:AcquireTime` = exposure time in seconds
-4. Set `HDF1:FilePath`, `HDF1:FileName`, `HDF1:NumCapture`
-5. Set `HDF1:Capture` = 1
-6. Set `cam1:Acquire` = 1
-7. Monitor `cam1:Acquire` — goes to 0 when done
-8. Set `HDF1:Capture` = 0 to close file
-
-### Trigger modes
-
-| Mode | `cam1:TriggerMode` | Behavior |
-|------|-------------------|----------|
-| Free-run | "Off" | Continuous acquisition at max frame rate |
-| External | "On" | Frame grabber gates to external trigger on LIN1 (TTLIO11) |
-| Software | via `TriggerSoftware` | Fire individual frames with `caput cam1:TriggerSoftware 1` |
-
-External trigger input is configured on the Euresys frame grabber's TTLIO11 line
-(default, rising edge). The camera can also accept triggers directly on its BNC
-trigger port.
-
-## Camera parameters
-
-### Controllable (live, no restart needed)
-
-| Parameter | Range | Notes |
-|-----------|-------|-------|
-| ExposureTime | ~7.3 us - 10 s | Set in seconds, applied to camera GenICam node |
-| Binning | 1, 2, 4 | Via frame grabber FPGA (Mean method). Stops/restarts acquisition to apply |
-
-### Read-only (hardware fixed)
-
-| Parameter | Value | Notes |
-|-----------|-------|-------|
-| Width | 4480 px | Full sensor, changes with binning (4480/2240/1120) |
-| Height | 2368 px | Full sensor, changes with binning (2368/1184/592) |
-| PixelFormat | Mono16 | 16-bit unsigned |
-| Max frame rate | ~110 fps | At full resolution, CXP-6 x4 |
-
-### Not available via CXP/GenTL
-
-The following parameters require DCAM-SDK and are not controllable through the
-CoaXPress GenTL interface:
-
-- Sensor temperature readout
-- Cooler control
-- Readout speed / direction
-- Shutter mode (rolling/global)
-- Sub-array / ROI
-- Camera-side binning
-- Advanced trigger configuration (polarity, delay, multi-gate)
-
-The camera's CXP GenICam XML (`HPK_C16240-20UP_Rev001.xml`) only exposes 8 nodes:
-Width, Height, PixelFormat, ExposureTime, AcquisitionMode, DeviceScanType,
-TapGeometry, Img1StreamId.
-
-## Frame grabber setup notes
-
-### Firmware update
-
-If `check_environment.py` or `gentl info` reports firmware status "TooOld":
+Frames are also published as NTNDArray on `<prefix>image1:ArrayData` (default),
+throttled to 30 fps for display. Use with `pyqtstream` or any PVA NTNDArray
+viewer:
 
 ```bash
-sudo /opt/euresys/egrabber-linux-x86_64-25.12.1.16/firmware/coaxlink-firmware update --card=coaxlink:0
+python pyqtstream.py --pv <prefix>image1:ArrayData
 ```
 
-Requires a full power cycle (not just reboot) after update.
+## Directory layout
 
-### CXP link status
+```
+detectors/
+├── core/
+│   ├── base.py              # BaseCamera ABC + CameraInfo
+│   └── registry.py          # Camera type registry / factory
+├── cameras/
+│   ├── hamamatsu/
+│   │   ├── orca_fire_dcam.py     # ORCA Fire via DCAM
+│   │   └── orca_fire_gentl.py    # ORCA Fire via Harvesters
+│   ├── teledyne/
+│   │   ├── oryx.py               # Oryx via Spinnaker
+│   │   └── kinetix.py            # Kinetix via PVCAM
+│   ├── tucsen/
+│   │   └── libra.py              # Libra 5514 Pro (skeleton)
+│   └── simulator.py              # Built-in simulator
+├── server/
+│   ├── ioc.py               # DetectorIOC (top-level)
+│   ├── cam_plugin.py        # cam1: PVs
+│   ├── hdf5_plugin.py       # HDF1: PVs
+│   └── ntnda_server.py      # PVAccess NTNDArray
+└── gui/
+    └── qt_gui.py            # Camera-agnostic Qt GUI
 
-Check link status:
-```bash
-/opt/euresys/egrabber/bin/x86_64/gentl genapi --module=if --get CxpConnectionState[A]
+run_ioc.py                   # Main entry point
+check_environment.py         # Environment / hardware checker
+firebird-driver-rhel9-patch/ # Patched Active Silicon driver source
 ```
 
-- **Connected**: Full CXP link — all features available
-- **Detected**: Degraded link (CXP-6 cables) — data streaming works, camera register writes blocked
+## DCAM (Hamamatsu) notes
 
-### Data stream configuration
+The Hamamatsu DCAM backend requires DCAM-API Lite for Linux installed at
+`/usr/local/hamamatsu_dcam/` and a supported frame grabber driver. On systems
+where `/usr/local` is read-only, see `firebird-driver-rhel9-patch/README.md`
+for the bind-mount workaround.
 
-When the CXP link is in "Detected" state, the frame grabber may not auto-detect
-the camera's resolution. The acquirer automatically configures the data stream
-by setting `ImageFormatSource=DataStream` and matching `RemoteWidth`/`RemoteHeight`
-to the camera's reported dimensions.
-
-## Environment check
-
-```bash
-python check_environment.py
-```
-
-Verifies: Python packages, GenTL producer, frame grabber driver, camera detection.
-
-## Files
-
-| File | Purpose |
-|------|---------|
-| `run_orca_ioc.py` | EPICS IOC entry point (headless or with GUI) |
-| `orca/epics_ad_server.py` | caproto PV server: CamPlugin + HDF5Plugin + NTNDArrayServer + OrcaFireIOC |
-| `orca/ioc_backend.py` | Adapter between IOC and Qt GUI (IOCBackend) |
-| `orca/qt_detector.py` | Qt GUI for parameter control and monitoring |
-| `orca/dummy_detector.py` | Detector backend with simulation fallback (DummyOrcaFireDetector) |
-| `orca/harvesters_orca_fire.py` | Low-level camera control via Harvesters/GenTL (OrcaFireAcquirer) |
-| `check_environment.py` | Pre-flight hardware and software checker |
+Critical: the DCAM library must be loaded with `ctypes.RTLD_GLOBAL` mode (the
+backend handles this) — otherwise the FireBird module can't resolve symbols
+and DCAM returns NOCAMERA.
