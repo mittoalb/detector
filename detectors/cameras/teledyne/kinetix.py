@@ -433,6 +433,25 @@ class TeledyneKinetix(BaseCamera):
         except Exception as exc:
             logger.warning("Could not set EXP_RES=us: %s", exc)
 
+        # Select a valid (port, speed, gain) combination. Without this,
+        # pl_exp_start_cont fails with PL_ERR_CONFIGURATION_INVALID because
+        # the camera has no readout mode selected after open. Matches
+        # ADKinetix.cpp:222-243 which calls applyReadoutMode() with saved
+        # user indices.
+        try:
+            ports = self._get_enum_values(PARAM_READOUT_PORT)
+            if ports:
+                port_value = ports[0][0]  # first port's enum value
+                self._set_param_raw(PARAM_READOUT_PORT, port_value)
+                self._set_param_raw(PARAM_SPDTAB_INDEX, 0)  # fastest speed
+                # PVCAM gain indices are 1-based
+                n_gain = int(self._get_param_raw(PARAM_GAIN_INDEX, ATTR_COUNT))
+                self._set_param_raw(PARAM_GAIN_INDEX, min(1, n_gain))
+                logger.info("Default readout: port=%d ('%s'), speed=0, gain=1",
+                            port_value, ports[0][1])
+        except Exception as exc:
+            logger.warning("Could not set default readout mode: %s", exc)
+
         # Default trigger and exposure — cached in Python and passed to
         # pl_exp_setup_cont at start_acquisition. PVCAM refuses
         # pl_set_param on PARAM_EXPOSURE_MODE / PARAM_EXPOSURE_TIME
