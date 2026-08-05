@@ -352,6 +352,11 @@ class TeledyneKinetix(BaseCamera):
         self._last_metadata: dict = {}
         # Per-param TYPE_ cache to avoid re-querying ATTR_TYPE every access
         self._param_type_cache: Dict[int, int] = {}
+        # Exposure time and trigger mode are NOT pl_set_param-writable on
+        # PVCAM — they're arguments to pl_exp_setup_cont. Cache them here
+        # and apply on the next start_acquisition().
+        self._exposure_time_units: int = 10000   # populated in open()
+        self._exp_mode: int = EXPOSURE_MODE["Internal"]
 
     # -----------------------------------------------------------------------
     # Lifecycle
@@ -419,14 +424,22 @@ class TeledyneKinetix(BaseCamera):
         self._rgn = rgn_type(0, ser - 1, 1, 0, par - 1, 1)
         self._frame_shape = (par, ser)
 
-        # Default trigger: External-edge for tomoscan PSO scans (matches
-        # the ORCA Fire backend). Users can flip to Internal from the GUI
-        # or by an EPICS put.
+        # Force microsecond exposure resolution so the IOC's default
+        # AcquireTime=0.01 s doesn't round to 0 (PARAM_EXP_RES defaults
+        # to seconds on many Kinetix units). The ADKinetix C++ driver
+        # does the same on open (ADKinetix.cpp:1050-1063).
         try:
-            self._set_param_raw(
-                PARAM_EXPOSURE_MODE, EXPOSURE_MODE["External"])
+            self._set_param_raw(PARAM_EXP_RES, 1)  # EXP_RES_ONE_MICROSEC
         except Exception as exc:
-            logger.warning("Could not set default TriggerMode=External: %s", exc)
+            logger.warning("Could not set EXP_RES=us: %s", exc)
+
+        # Default trigger and exposure — cached in Python and passed to
+        # pl_exp_setup_cont at start_acquisition. PVCAM refuses
+        # pl_set_param on PARAM_EXPOSURE_MODE / PARAM_EXPOSURE_TIME
+        # (PL_ERR_ACCESS_DENIED); the C++ driver does the same thing.
+        self._exp_mode = EXPOSURE_MODE["Internal"]
+        # Default 10 ms exposure in current EXP_RES units
+        self._exposure_time_units = int(round(0.010 / self._exposure_scale_to_seconds()))
 
         logger.info("Opened %s SN=%s (%dx%d, %d-bit)",
                     self.display_name, serial, ser, par, bpc)
@@ -570,14 +583,12 @@ class TeledyneKinetix(BaseCamera):
             src = self.get_param("TriggerSource")
             return "On" if src == "External" else "Off"
         if name == "TriggerSource":
-            v = int(self._get_param_raw(PARAM_EXPOSURE_MODE, ATTR_CURRENT))
-            label = EXPOSURE_MODE_INV.get(v, "Internal")
+            label = EXPOSURE_MODE_INV.get(self._exp_mode, "Internal")
             if label in ("ExternalLevel", "TriggerFirst", "LevelOverlap"):
                 return "External"
             return label if label in ("Internal", "External", "Software") else "Internal"
         if name == "TriggerActive":
-            v = int(self._get_param_raw(PARAM_EXPOSURE_MODE, ATTR_CURRENT))
-            return "Level" if v == EXPOSURE_MODE["ExternalLevel"] else "Edge"
+            return "Level" if self._exp_mode == EXPOSURE_MODE["ExternalLevel"] else "Edge"
         if name == "TriggerPolarity":
             return "Positive"  # PVCAM triggers are edge-rising by default
         if name == "AcquisitionFrameRate":
@@ -627,27 +638,33 @@ class TeledyneKinetix(BaseCamera):
             return
         if name == "TriggerMode":
             # areaDetector "Off" -> Internal, "On" -> External
-            self._require_idle(name)
-            mode = EXPOSURE_MODE["Internal" if str(value) == "Off" else "External"]
-            self._set_param_raw(PARAM_EXPOSURE_MODE, mode)
+            self._exp_mode = EXPOSURE_MODE[
+                "Internal" if str(value) == "Off" else "External"]
+            if self._is_acquiring:
+                self.stop_acquisition()
+                self.start_acquisition()
             return
         if name == "TriggerSource":
-            self._require_idle(name)
             v = EXPOSURE_MODE.get(str(value))
             if v is None:
                 raise ValueError(
                     f"Invalid TriggerSource {value!r}. "
                     f"Allowed: {list(EXPOSURE_MODE)}")
-            self._set_param_raw(PARAM_EXPOSURE_MODE, v)
+            self._exp_mode = v
+            if self._is_acquiring:
+                self.stop_acquisition()
+                self.start_acquisition()
             return
         if name == "TriggerActive":
-            self._require_idle(name)
             v = TRIGGER_ACTIVE.get(str(value))
             if v is None:
                 raise ValueError(
                     f"Invalid TriggerActive {value!r}. "
                     f"Allowed: {list(TRIGGER_ACTIVE)}")
-            self._set_param_raw(PARAM_EXPOSURE_MODE, v)
+            self._exp_mode = v
+            if self._is_acquiring:
+                self.stop_acquisition()
+                self.start_acquisition()
             return
         if name in ("TriggerPolarity", "TriggerDelay",
                     "SensorCooler", "SensorCoolerStatus"):
@@ -758,14 +775,17 @@ class TeledyneKinetix(BaseCamera):
         return {0: 1e-3, 1: 1e-6, 2: 1.0}.get(res, 1e-3)
 
     def _get_exposure_time_seconds(self) -> float:
-        raw = int(self._get_param_raw(PARAM_EXPOSURE_TIME, ATTR_CURRENT))
-        return raw * self._exposure_scale_to_seconds()
+        return self._exposure_time_units * self._exposure_scale_to_seconds()
 
     def _set_exposure_time_seconds(self, seconds: float) -> None:
         scale = self._exposure_scale_to_seconds()
-        # Kinetix stores exposure as uns64; the value we set is in EXP_RES units.
-        raw = max(1, int(round(seconds / scale)))
-        self._set_param_raw(PARAM_EXPOSURE_TIME, raw)
+        # PVCAM refuses pl_set_param on PARAM_EXPOSURE_TIME. The value is
+        # passed to pl_exp_setup_cont at start_acquisition. Store it here.
+        self._exposure_time_units = max(1, int(round(seconds / scale)))
+        # If already acquiring, restart to pick up the new exposure.
+        if self._is_acquiring:
+            self.stop_acquisition()
+            self.start_acquisition()
 
     def _compute_frame_rate(self) -> float:
         """Approximate frame rate from exposure + readout time."""
@@ -809,14 +829,10 @@ class TeledyneKinetix(BaseCamera):
         height = (self._rgn.p2 - self._rgn.p1 + 1) // max(1, self._rgn.pbin)
         self._frame_shape = (int(height), int(width))
 
-        exp_time_units = int(self._get_param_raw(
-            PARAM_EXPOSURE_TIME, ATTR_CURRENT))
-        exp_mode = int(self._get_param_raw(PARAM_EXPOSURE_MODE, ATTR_CURRENT))
-
         exp_bytes = uns32()
         if _pvcam_lib.pl_exp_setup_cont(
                 self._hcam, 1, ctypes.byref(self._rgn),
-                int16(exp_mode), uns32(exp_time_units),
+                int16(self._exp_mode), uns32(self._exposure_time_units),
                 ctypes.byref(exp_bytes), int16(CIRC_OVERWRITE)) != PV_OK:
             raise RuntimeError(f"pl_exp_setup_cont: {_last_pvcam_error()}")
         self._exp_bytes = int(exp_bytes.value)
