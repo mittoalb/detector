@@ -315,7 +315,7 @@ class TeledyneKinetix(BaseCamera):
     camera_type = "teledyne.kinetix"
     display_name = "Teledyne Photometrics Kinetix (PVCAM)"
 
-    NUM_BUFFERS = 20
+    NUM_BUFFERS = 5
 
     # Standard-name -> (PARAM_ID, TYPE_ hint) for pass-through get/set.
     # TYPE_ hint is a fallback; actual type is queried per-param and cached.
@@ -447,11 +447,14 @@ class TeledyneKinetix(BaseCamera):
         # (returning PV_FAIL with PL_ERR_NONE) on others. Keep the
         # CFUNCTYPE reference alive so it isn't GC'd.
         self._callback_ref = PVCAM_CALLBACK(self._on_eof)
-        if _pvcam_lib.pl_cam_register_callback_ex3(
-                self._hcam, PL_CALLBACK_EOF,
-                ctypes.cast(self._callback_ref, ctypes.c_void_p), None) != PV_OK:
-            logger.warning("pl_cam_register_callback_ex3: %s",
+        cb_ok = _pvcam_lib.pl_cam_register_callback_ex3(
+            self._hcam, PL_CALLBACK_EOF,
+            ctypes.cast(self._callback_ref, ctypes.c_void_p), None)
+        if cb_ok != PV_OK:
+            logger.warning("pl_cam_register_callback_ex3 failed: %s",
                            _last_pvcam_error())
+        else:
+            logger.info("EOF callback registered")
 
         logger.info("Opened %s SN=%s (%dx%d, %d-bit)",
                     self.display_name, serial, ser, par, bpc)
@@ -856,8 +859,11 @@ class TeledyneKinetix(BaseCamera):
         self._exp_bytes = int(exp_bytes.value)
 
         buf_bytes = self._exp_bytes * self.NUM_BUFFERS
-        self._circ_buf = (ctypes.c_uint8 * buf_bytes)()
-        buf_ptr = ctypes.cast(self._circ_buf, ctypes.c_void_p)
+        # Use numpy for the circular buffer — page-aligned by default,
+        # which the pvcam_pcie kernel driver needs for direct DMA mapping
+        # (see `dmesg | grep pvcam` — "mapping user buffer directly for DMA").
+        self._circ_buf = np.zeros(buf_bytes, dtype=np.uint8)
+        buf_ptr = self._circ_buf.ctypes.data_as(ctypes.c_void_p)
 
         # Drain any stale frames from a previous run
         while not self._frame_queue.empty():
@@ -867,9 +873,10 @@ class TeledyneKinetix(BaseCamera):
                 break
 
         logger.info("start_acquisition: %dx%d, exp_mode=0x%X, exp_time=%d, "
-                    "%d bytes/frame, %d buffers, total=%d bytes",
+                    "%d bytes/frame, %d buffers, total=%d bytes, buf_addr=0x%X",
                     width, height, self._exp_mode, self._exposure_time_units,
-                    self._exp_bytes, self.NUM_BUFFERS, buf_bytes)
+                    self._exp_bytes, self.NUM_BUFFERS, buf_bytes,
+                    buf_ptr.value or 0)
 
         if _pvcam_lib.pl_exp_start_cont(
                 self._hcam, buf_ptr, uns32(buf_bytes)) != PV_OK:
