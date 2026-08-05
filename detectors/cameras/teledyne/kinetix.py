@@ -293,6 +293,8 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
     lib.pl_error_code.restype = int16
     lib.pl_error_message.restype = rs_bool
     lib.pl_error_message.argtypes = [int16, ctypes.c_char_p]
+    lib.pl_pp_reset.restype = rs_bool
+    lib.pl_pp_reset.argtypes = [int16]
 
 
 def _last_pvcam_error() -> str:
@@ -423,6 +425,16 @@ class TeledyneKinetix(BaseCamera):
         # Initialize ROI to full frame
         self._rgn = rgn_type(0, ser - 1, 1, 0, par - 1, 1)
         self._frame_shape = (par, ser)
+
+        # Reset any pre-configured post-processing. Without this, stale
+        # settings from a previous session (e.g. a prior ADKinetix IOC
+        # run) leave the camera in a state where pl_exp_start_cont
+        # rejects with PL_ERR_CONFIGURATION_INVALID.
+        # Matches ADKinetix.cpp:662.
+        try:
+            _pvcam_lib.pl_pp_reset(self._hcam)
+        except Exception as exc:
+            logger.warning("pl_pp_reset failed: %s", exc)
 
         # Force microsecond exposure resolution so the IOC's default
         # AcquireTime=0.01 s doesn't round to 0 (PARAM_EXP_RES defaults
