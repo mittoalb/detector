@@ -61,6 +61,8 @@ CCS_HALT = 1
 # PARAM_* IDs (verified against pvcam.h)
 # ---------------------------------------------------------------------------
 
+PARAM_METADATA_ENABLED = 0x0B030168   # CLASS3 | TYPE_BOOLEAN | 168
+PARAM_FRAME_BUFFER_ALIGNMENT = 0x0703012C  # not always present
 PARAM_CAM_INTERFACE_TYPE = 0x0900000A
 PARAM_VENDOR_NAME = 0x0D020083
 PARAM_PRODUCT_NAME = 0x0D020084
@@ -435,6 +437,17 @@ class TeledyneKinetix(BaseCamera):
             _pvcam_lib.pl_pp_reset(self._hcam)
         except Exception as exc:
             logger.warning("pl_pp_reset failed: %s", exc)
+
+        # Disable frame-embedded metadata. When it's on, PVCAM appends a
+        # header to each frame and the buffer must include that overhead;
+        # if the buffer is sized without it, pl_exp_start_cont fails
+        # (sometimes with PL_ERR_NONE — no error recorded). Explicit off
+        # matches the C++ driver's assumption.
+        try:
+            if self._is_param_available(PARAM_METADATA_ENABLED):
+                self._set_param_raw(PARAM_METADATA_ENABLED, 0)
+        except Exception as exc:
+            logger.debug("PARAM_METADATA_ENABLED: %s", exc)
 
         # Force microsecond exposure resolution so the IOC's default
         # AcquireTime=0.01 s doesn't round to 0 (PARAM_EXP_RES defaults
@@ -881,10 +894,15 @@ class TeledyneKinetix(BaseCamera):
         height = (self._rgn.p2 - self._rgn.p1 + 1) // max(1, self._rgn.pbin)
         self._frame_shape = (int(height), int(width))
 
+        # exp_mode = trigger mode OR'd with expose-out mode. The Kinetix
+        # requires a valid expose-out selection; EXPOSE_OUT_FIRST_ROW is
+        # the safest default (matches ADKinetix.cpp:890,892,894).
+        combined_mode = self._exp_mode | EXPOSE_OUT_MODE["FirstRow"]
+
         exp_bytes = uns32()
         if _pvcam_lib.pl_exp_setup_cont(
                 self._hcam, 1, ctypes.byref(self._rgn),
-                int16(self._exp_mode), uns32(self._exposure_time_units),
+                int16(combined_mode), uns32(self._exposure_time_units),
                 ctypes.byref(exp_bytes), int16(CIRC_OVERWRITE)) != PV_OK:
             raise RuntimeError(f"pl_exp_setup_cont: {_last_pvcam_error()}")
         self._exp_bytes = int(exp_bytes.value)
