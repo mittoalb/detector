@@ -441,6 +441,18 @@ class TeledyneKinetix(BaseCamera):
         # Default 10 ms exposure in current EXP_RES units
         self._exposure_time_units = int(round(0.010 / self._exposure_scale_to_seconds()))
 
+        # Register EOF callback ONCE for the camera's lifetime — matches
+        # the C++ driver (ADKinetix.cpp:676). Registering/deregistering
+        # per acquisition works on some PVCAM versions and fails silently
+        # (returning PV_FAIL with PL_ERR_NONE) on others. Keep the
+        # CFUNCTYPE reference alive so it isn't GC'd.
+        self._callback_ref = PVCAM_CALLBACK(self._on_eof)
+        if _pvcam_lib.pl_cam_register_callback_ex3(
+                self._hcam, PL_CALLBACK_EOF,
+                ctypes.cast(self._callback_ref, ctypes.c_void_p), None) != PV_OK:
+            logger.warning("pl_cam_register_callback_ex3: %s",
+                           _last_pvcam_error())
+
         logger.info("Opened %s SN=%s (%dx%d, %d-bit)",
                     self.display_name, serial, ser, par, bpc)
 
@@ -452,10 +464,16 @@ class TeledyneKinetix(BaseCamera):
                 pass
         if self._hcam is not None:
             try:
+                _pvcam_lib.pl_cam_deregister_callback(
+                    self._hcam, PL_CALLBACK_EOF)
+            except Exception:
+                pass
+            try:
                 _pvcam_lib.pl_cam_close(self._hcam)
             except Exception:
                 pass
             self._hcam = None
+        self._callback_ref = None
         self._info = None
         _pvcam_uninit()
 
@@ -839,6 +857,7 @@ class TeledyneKinetix(BaseCamera):
 
         buf_bytes = self._exp_bytes * self.NUM_BUFFERS
         self._circ_buf = (ctypes.c_uint8 * buf_bytes)()
+        buf_ptr = ctypes.cast(self._circ_buf, ctypes.c_void_p)
 
         # Drain any stale frames from a previous run
         while not self._frame_queue.empty():
@@ -847,32 +866,19 @@ class TeledyneKinetix(BaseCamera):
             except queue.Empty:
                 break
 
-        # Register EOF callback BEFORE start so we don't miss the first frame.
-        # Keep a Python-side reference to the CFUNCTYPE object — otherwise
-        # it gets GC'd and PVCAM segfaults.
-        self._callback_ref = PVCAM_CALLBACK(self._on_eof)
-        if _pvcam_lib.pl_cam_register_callback_ex3(
-                self._hcam, PL_CALLBACK_EOF,
-                ctypes.cast(self._callback_ref, ctypes.c_void_p), None) != PV_OK:
-            raise RuntimeError(
-                f"pl_cam_register_callback_ex3: {_last_pvcam_error()}")
+        logger.info("start_acquisition: %dx%d, exp_mode=0x%X, exp_time=%d, "
+                    "%d bytes/frame, %d buffers, total=%d bytes",
+                    width, height, self._exp_mode, self._exposure_time_units,
+                    self._exp_bytes, self.NUM_BUFFERS, buf_bytes)
 
         if _pvcam_lib.pl_exp_start_cont(
-                self._hcam, self._circ_buf, uns32(buf_bytes)) != PV_OK:
-            # Roll back the callback registration on failure
-            try:
-                _pvcam_lib.pl_cam_deregister_callback(
-                    self._hcam, PL_CALLBACK_EOF)
-            except Exception:
-                pass
-            self._callback_ref = None
+                self._hcam, buf_ptr, uns32(buf_bytes)) != PV_OK:
             self._circ_buf = None
             raise RuntimeError(
                 f"pl_exp_start_cont: {_last_pvcam_error()}")
 
         self._is_acquiring = True
-        logger.info("Started acquisition: %dx%d, %d bytes/frame, %d buffers",
-                    width, height, self._exp_bytes, self.NUM_BUFFERS)
+        logger.info("Acquisition started")
 
     def stop_acquisition(self) -> None:
         if not self._is_acquiring:
@@ -881,15 +887,10 @@ class TeledyneKinetix(BaseCamera):
             _pvcam_lib.pl_exp_stop_cont(self._hcam, int16(CCS_HALT))
         except Exception:
             pass
-        try:
-            _pvcam_lib.pl_cam_deregister_callback(
-                self._hcam, PL_CALLBACK_EOF)
-        except Exception:
-            pass
-        self._callback_ref = None
+        # NOTE: callback stays registered for the camera's lifetime.
         self._circ_buf = None
         self._is_acquiring = False
-        logger.info("Stopped acquisition")
+        logger.info("Acquisition stopped")
 
     def acquire_frame(self, timeout_ms: int = 5000) -> np.ndarray:
         if not self._is_acquiring:
