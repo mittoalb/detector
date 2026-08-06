@@ -10,7 +10,7 @@ single-file addition.
 |---------|--------|-----|
 | `hamamatsu.orca_fire_dcam` | Hamamatsu ORCA Fire C16240-20UP | DCAM-API + Active Silicon FireBird |
 | `hamamatsu.orca_fire_gentl` | Hamamatsu ORCA Fire C16240-20UP | Harvesters/GenTL + Euresys Coaxlink |
-| `teledyne.oryx` | Teledyne FLIR Oryx (CXP) | Spinnaker SDK + PySpin |
+| `teledyne.oryx` | Teledyne FLIR Oryx (10GigE / CXP) | Spinnaker C API (direct ctypes — no PySpin) |
 | `teledyne.kinetix` | Teledyne Photometrics Kinetix | PVCAM + PyVCAM |
 | `simulator` | Synthetic frames | none — built in |
 
@@ -44,16 +44,24 @@ a single new file in `detectors/cameras/<vendor>/`.
 ### GUI process model
 
 With `--gui`, `run_ioc.py` launches the Qt GUI as a **separate process** that
-connects to the IOC via ChannelAccess and pvAccess. The GUI talks to the IOC
-purely over the network (`caproto.threading.client` + `pvaccess`) through a
-proxy layer (`detectors/gui/ca_proxy.py`) that mirrors the in-process IOC
-interface the GUI was written against.
+talks to the driver process over three channels:
 
-Why: some vendor drivers (notably Photometrics PVCAM used by the Kinetix
-backend) install signal handlers that Qt's `QApplication` clobbers when they
-share a process. In-process Qt then silently starves the camera's DMA loop.
-Running Qt in its own process side-steps this uniformly for every backend —
-no per-camera branching in the launcher, no threading hacks.
+- **Channel Access** — the standard `<prefix>cam1:` / `<prefix>HDF1:` PVs, for
+  compatibility with tomoscan and other EPICS clients.
+- **pvAccess NTNDArray** — live frames on `<prefix>image1:ArrayData`.
+- **Local UNIX-socket IPC** — a JSON-RPC channel at
+  `/tmp/detector_ioc_<prefix>.sock` that carries the camera's *full* BaseCamera
+  surface (every GenICam node on the Oryx, every DCAM property on the ORCA,
+  every PVCAM param on the Kinetix). Lets the GUI enumerate and edit
+  features without needing a matching EPICS PV for each one. Falls back to
+  the CA gateway transparently if the socket isn't reachable.
+
+Why the process split: some vendor drivers (notably Photometrics PVCAM used
+by the Kinetix backend) install signal handlers that Qt's `QApplication`
+clobbers when they share a process. In-process Qt then silently starves the
+camera's DMA loop. Running Qt in its own process side-steps this uniformly
+for every backend — no per-camera branching in the launcher, no threading
+hacks.
 
 ## Installation
 
@@ -72,7 +80,7 @@ pip install imageio  # optional, for TIFF export
 |---------|---------|
 | `hamamatsu.orca_fire_dcam` | DCAM-API Lite for Linux + FireBird kernel driver. See `firebird-driver-rhel9-patch/README.md` |
 | `hamamatsu.orca_fire_gentl` | `pip install harvesters` + Euresys eGrabber |
-| `teledyne.oryx` | Spinnaker SDK + `pip install spinnaker-python` |
+| `teledyne.oryx` | Spinnaker SDK (`libSpinnaker_C.so.2`) — no Python bindings required, direct ctypes |
 | `teledyne.kinetix` | PVCAM SDK (`libpvcam.so.2`) — no Python bindings required, direct ctypes |
 
 ## Running
@@ -89,7 +97,10 @@ python run_ioc.py --camera hamamatsu.orca_fire_dcam --prefix ORCA:
 python run_ioc.py --camera teledyne.oryx --prefix ORYX:
 python run_ioc.py --camera simulator --prefix SIM:
 
-# With Qt GUI
+# Oryx: pick a specific camera by serial (matches ADSpinnaker's CAMERA_ID)
+python run_ioc.py --camera teledyne.oryx --serial 23605513 --prefix ORYX:
+
+# With Qt GUI (subprocess, connects via CA/PVA + local IPC)
 python run_ioc.py --camera simulator --gui
 
 # Show all served PVs
@@ -98,6 +109,15 @@ python run_ioc.py --camera simulator --list-pvs
 # Custom PVA stream PV name
 python run_ioc.py --camera simulator --pva-pv MYDET:image:NTNDArray
 ```
+
+### Logging colors
+
+The console uses ANSI-256 colors on level (INFO cyan, WARNING amber, ERROR
+red, CRITICAL bold magenta). Disable / force via standard env vars:
+
+- `NO_COLOR=1` — disable regardless of TTY (https://no-color.org)
+- `FORCE_COLOR=1` or `CLICOLOR_FORCE=1` — enable even when piped (`| tee`)
+- default: auto-detect via `sys.stderr.isatty()`
 
 ## Adding a new camera
 
@@ -169,6 +189,9 @@ across cameras:
 | `SensorTemperatureTarget` | float | Cooler setpoint |
 
 Backends raise `KeyError` for unsupported parameters; the GUI hides them.
+Backends may *also* expose vendor-specific names (e.g. every GenICam node
+on the Oryx) — the GUI shows those in auto-grouped tabs alongside the
+standard names.
 
 ## EPICS PVs
 
@@ -210,21 +233,59 @@ detectors/
 │   │   ├── oryx.py               # Oryx via Spinnaker
 │   │   └── kinetix.py            # Kinetix via PVCAM
 │   └── simulator.py              # Built-in simulator
+├── core/
+│   ├── base.py              # BaseCamera ABC + CameraInfo
+│   ├── registry.py          # Camera type registry / factory
+│   └── log_util.py          # ANSI color logging shared by driver + GUI
 ├── server/
-│   ├── ioc.py               # DetectorIOC (top-level)
-│   ├── cam_plugin.py        # cam1: PVs
+│   ├── ioc.py               # DetectorIOC (top-level; wires plugins + IPC)
+│   ├── cam_plugin.py        # cam1: PVs (+ background poller for RO values)
 │   ├── hdf5_plugin.py       # HDF1: PVs
+│   ├── tiff_plugin.py       # TIF1: PVs
+│   ├── ipc.py               # UNIX-socket JSON-RPC to the GUI
 │   └── ntnda_server.py      # PVAccess NTNDArray
 └── gui/
     ├── qt_gui.py            # Camera-agnostic Qt GUI (also standalone entry:
     │                        #   `python -m detectors.gui.qt_gui --prefix P:`)
-    └── ca_proxy.py          # CA/PVA-backed IocProxy — lets qt_gui.py run
-                             # against just an IOC prefix (subprocess mode)
+    ├── ca_proxy.py          # CA/PVA-backed IocProxy — lets qt_gui.py run
+    │                        # against just an IOC prefix (subprocess mode)
+    └── ipc_client.py        # UNIX-socket client for full-fidelity access
+                             # to the camera's list_params/get/set surface
 
 run_ioc.py                   # Main entry point
 check_environment.py         # Environment / hardware checker
 firebird-driver-rhel9-patch/ # Patched Active Silicon driver source
 ```
+
+## Spinnaker (Oryx) notes
+
+Direct-`ctypes` binding to `libSpinnaker_C.so.2`. No `PySpin` dependency
+(Spinnaker Python wheels lag behind Python versions; ctypes works on 3.13).
+
+- The library is picked up from `LD_LIBRARY_PATH` first, then falls back to
+  the vendor path shipped with ADSpinnaker at
+  `/APSshare/epics/synApps_6_2_1/support/areaDetector-R3-12-1/ADSpinnaker/spinnakerSupport/os/linux-x86_64/`.
+  The loader pre-loads transitive C++ dependencies
+  (`libLog_*`, `libMathParser_*`, `libGenApi_*`, `libSpinnaker.so.2`) with
+  `RTLD_GLOBAL` so no shell-side `LD_LIBRARY_PATH` setup is required.
+- Spinnaker claims the camera exclusively per process — stop any running
+  ADSpinnaker C++ IOC (e.g. `32idbSP1`) before starting this Python one.
+- Select a specific camera by serial: `--serial 23605513` (matches the
+  ADSpinnaker `CAMERA_ID` convention).
+- The backend exposes the *full* GenICam node map through `list_params()`
+  (2000+ nodes on the Oryx). The GUI auto-groups leftovers by name prefix
+  (Analog/Gain, Trigger, Chunk Data, Transport Layer, Device Info, …) so
+  it stays browsable.
+- ROI-affecting nodes (`Width`, `Height`, `OffsetX/Y`, `Binning*`,
+  `PixelFormat`) are locked during acquisition by the SDK. `set_param` on
+  those pauses acquisition, applies the write, and restarts — writes go
+  through mid-run without the caller having to know.
+- Pixel formats: only unpacked `Mono8` / `Mono16` are supported for
+  acquisition. `Mono12Packed` raises a clear error at `start_acquisition` —
+  set `PixelFormat=Mono16` from the GUI or via CA before starting.
+- `SensorWidth`/`SensorHeight` (true sensor size) are preferred over
+  `WidthMax`/`HeightMax` when populating `CameraInfo` — WidthMax is the
+  max ROI *in the current binning mode* and misreports when binning > 1.
 
 ## PVCAM (Kinetix) notes
 

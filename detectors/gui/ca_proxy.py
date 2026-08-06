@@ -99,7 +99,17 @@ class _CAField:
 
 
 class _CADataDict:
-    """Behaves like `._data` — supports `['value']` read and write."""
+    """Behaves like `._data` — supports `['value']` read and write.
+
+    Two subprocess-mode quirks handled here:
+    - A CA read that returns None (empty/missing) is mapped to the
+      declared default. The GUI does `str(value)` on results and would
+      otherwise turn None into the literal string "None".
+    - Writes to _RBV PVs are silently swallowed. In-process, qt_gui.py's
+      `writer.FilePath_RBV._data['value'] = path` is a Python assignment;
+      over CA it hits a read_only PV and caproto raises Forbidden. The
+      driver-side plugin owns readback updates anyway.
+    """
 
     def __init__(self, ca, pvname, default, cast):
         self._ca = ca
@@ -113,6 +123,8 @@ class _CADataDict:
         try:
             resp = self._ca.get(self._pvname, timeout=0.5)
             v = _decode_ca_value(resp)
+            if v is None:
+                return self._default
             if self._cast is not None:
                 try:
                     v = self._cast(v)
@@ -125,6 +137,9 @@ class _CADataDict:
     def __setitem__(self, key, value):
         if key != "value":
             raise KeyError(key)
+        # Swallow writes to readback PVs — the driver process owns them.
+        if self._pvname.endswith("_RBV"):
+            return
         try:
             self._ca.put(self._pvname, value, wait=False)
         except Exception as exc:
@@ -151,30 +166,67 @@ class _CAHelper:
 
 
 class CameraProxy:
-    """BaseCamera-shaped proxy that reads/writes params via CA."""
+    """BaseCamera-shaped proxy that reads/writes params via IPC (preferred)
+    or falls back to CA when the driver's IPC socket isn't reachable.
+
+    The IPC path gives full access to whatever the backend's list_params
+    exposes — every Oryx GenICam node, every DCAM property, etc. The CA
+    fallback keeps working with the hardcoded 15-key surface so nothing
+    breaks if the socket is missing (older IOC, remote machine, etc.).
+    """
 
     def __init__(self, ca: _CAHelper, prefix: str):
         self._ca = ca
         self._prefix = prefix
-        # Populate CameraInfo from CA reads
-        from detectors.core.base import CameraInfo
+
+        # Try IPC first — the driver process opens a UNIX socket at a
+        # deterministic path derived from the prefix. If it's there, use it.
+        self._ipc = None
         try:
-            vendor = str(self._safe_get("cam1:Manufacturer_RBV", "Unknown"))
-            model = str(self._safe_get("cam1:Model_RBV", "Camera"))
-            w = int(self._safe_get("cam1:MaxSizeX_RBV", 0) or 0)
-            h = int(self._safe_get("cam1:MaxSizeY_RBV", 0) or 0)
-        except Exception:
-            vendor = "Unknown"
-            model = "Camera"
-            w = h = 0
-        self._info = CameraInfo(
-            vendor=vendor, model=model,
-            sensor_width=w, sensor_height=h,
-            bits_per_pixel=16, max_frame_rate=60.0,
-            supported_binning=[1, 2, 4],
-            supported_trigger_modes=["Internal", "External", "Software"],
-            has_temperature=True, has_cooler=True, has_subarray=True,
-        )
+            from detectors.server.ipc import socket_path_for
+            from detectors.gui.ipc_client import CameraIPCClient
+            self._ipc = CameraIPCClient(socket_path_for(prefix))
+            logger.info("CameraProxy using IPC to driver process")
+        except Exception as exc:
+            logger.info(
+                "CameraProxy IPC unavailable (%s); falling back to CA gateway",
+                exc)
+
+        # Populate CameraInfo — prefer live IPC, fall back to CA reads
+        from detectors.core.base import CameraInfo
+        info_dict = None
+        if self._ipc is not None:
+            try:
+                info_dict = self._ipc.get_info()
+            except Exception as exc:
+                logger.debug("IPC get_info failed: %s", exc)
+        if info_dict:
+            self._info = CameraInfo(**{
+                k: v for k, v in info_dict.items()
+                if k in {"vendor", "model", "sensor_width", "sensor_height",
+                          "bits_per_pixel", "pixel_size_um",
+                          "max_frame_rate", "supported_binning",
+                          "supported_trigger_modes", "has_temperature",
+                          "has_cooler", "has_subarray", "serial_number",
+                          "firmware_version"}})
+        else:
+            try:
+                vendor = str(self._safe_get("cam1:Manufacturer_RBV", "Unknown"))
+                model = str(self._safe_get("cam1:Model_RBV", "Camera"))
+                w = int(self._safe_get("cam1:MaxSizeX_RBV", 0) or 0)
+                h = int(self._safe_get("cam1:MaxSizeY_RBV", 0) or 0)
+            except Exception:
+                vendor = "Unknown"
+                model = "Camera"
+                w = h = 0
+            self._info = CameraInfo(
+                vendor=vendor, model=model,
+                sensor_width=w, sensor_height=h,
+                bits_per_pixel=16, max_frame_rate=60.0,
+                supported_binning=[1, 2, 4],
+                supported_trigger_modes=["Internal", "External", "Software"],
+                has_temperature=True, has_cooler=True, has_subarray=True,
+            )
 
     # BaseCamera-like API used by the GUI
     def is_open(self) -> bool:
@@ -183,47 +235,95 @@ class CameraProxy:
     def get_info(self):
         return self._info
 
+    # standard-name -> (setter PV, cast, read-PV-suffix)
+    # setter PV is what set_param writes to; read PV is (setter, read) with
+    # read defaulting to setter if omitted. This split matters for params
+    # like OffsetX where set_param must hit "cam1:OffsetX" (has a putter)
+    # but get_param should read the live "cam1:OffsetX_RBV".
     _STANDARD_TO_PV = {
-        "ExposureTime": ("cam1:AcquireTime", float),
-        "AcquisitionFrameRate": ("cam1:AcquireTime_RBV", float),
-        "Width": ("cam1:SizeX_RBV", int),
-        "Height": ("cam1:SizeY_RBV", int),
-        "OffsetX": ("cam1:MinX", int),
-        "OffsetY": ("cam1:MinY", int),
-        "BinningHorizontal": ("cam1:BinX", int),
-        "BinningVertical": ("cam1:BinY", int),
-        "PixelFormat": ("cam1:PixelFormat_RBV", str),
-        "TriggerMode": ("cam1:TriggerMode", str),
-        "TriggerSource": ("cam1:TriggerSource", str),
-        "SensorTemperature": ("cam1:SensorTemperature_RBV", float),
+        "ExposureTime": ("cam1:AcquireTime", float, "cam1:AcquireTime_RBV"),
+        "AcquisitionFrameRate": ("cam1:AcquisitionFrameRate_RBV", float, None),
+        "Width": ("cam1:SizeX", int, "cam1:SizeX_RBV"),
+        "Height": ("cam1:SizeY", int, "cam1:SizeY_RBV"),
+        "OffsetX": ("cam1:OffsetX", int, "cam1:OffsetX_RBV"),
+        "OffsetY": ("cam1:OffsetY", int, "cam1:OffsetY_RBV"),
+        "BinningHorizontal": ("cam1:BinX", int, "cam1:BinX_RBV"),
+        "BinningVertical": ("cam1:BinY", int, "cam1:BinY_RBV"),
+        "PixelFormat": ("cam1:PixelFormat", str, "cam1:PixelFormat_RBV"),
+        "TriggerMode": ("cam1:TriggerMode", str, "cam1:TriggerMode_RBV"),
+        "TriggerSource": ("cam1:TriggerSource", str, None),
+        "TriggerActive": ("cam1:TriggerActive", str, "cam1:TriggerActive_RBV"),
+        "TriggerDelay": ("cam1:TriggerDelay", float, "cam1:TriggerDelay_RBV"),
+        "SensorTemperature": ("cam1:SensorTemperature_RBV", float, None),
+        "SensorCoolerStatus": ("cam1:SensorCoolerStatus_RBV", str, None),
     }
 
     def list_params(self) -> List[str]:
+        if self._ipc is not None:
+            try:
+                return self._ipc.list_params()
+            except Exception as exc:
+                logger.debug("IPC list_params failed, using CA fallback: %s", exc)
         return list(self._STANDARD_TO_PV)
 
     def get_param(self, name: str) -> Any:
-        pv_short, cast = self._STANDARD_TO_PV.get(name, (None, None))
-        if pv_short is None:
+        if self._ipc is not None:
+            try:
+                return self._ipc.get_param(name)
+            except Exception as exc:
+                logger.debug("IPC get_param(%s) failed, using CA fallback: %s",
+                             name, exc)
+        entry = self._STANDARD_TO_PV.get(name)
+        if entry is None:
             return None
-        return self._safe_get(pv_short, None, cast)
+        setter, cast, read_pv = entry
+        return self._safe_get(read_pv or setter, None, cast)
 
     def set_param(self, name: str, value: Any) -> None:
-        pv_short, cast = self._STANDARD_TO_PV.get(name, (None, None))
-        if pv_short is None:
+        if self._ipc is not None:
+            try:
+                self._ipc.set_param(name, value)
+                return
+            except Exception as exc:
+                logger.debug("IPC set_param(%s=%s) failed, using CA fallback: %s",
+                             name, value, exc)
+        entry = self._STANDARD_TO_PV.get(name)
+        if entry is None:
             return
+        setter, cast, _ = entry
         try:
-            self._ca.put(f"{self._prefix}{pv_short}",
+            self._ca.put(f"{self._prefix}{setter}",
                          cast(value) if cast else value, wait=False)
         except Exception as exc:
             logger.debug("set_param %s=%s: %s", name, value, exc)
 
     def is_param_supported(self, name: str) -> bool:
+        if self._ipc is not None:
+            try:
+                return name in self._ipc.list_params()
+            except Exception:
+                pass
         return name in self._STANDARD_TO_PV
 
     def is_param_writable(self, name: str) -> bool:
-        return name in self._STANDARD_TO_PV and not name.endswith("_RBV")
+        if self._ipc is not None:
+            try:
+                return self._ipc.is_param_writable(name)
+            except Exception as exc:
+                logger.debug("IPC is_param_writable(%s) failed: %s", name, exc)
+        entry = self._STANDARD_TO_PV.get(name)
+        if entry is None:
+            return False
+        setter, _, _ = entry
+        return not setter.endswith("_RBV")
 
     def software_trigger(self) -> None:
+        if self._ipc is not None:
+            try:
+                self._ipc.software_trigger()
+                return
+            except Exception as exc:
+                logger.debug("IPC software_trigger failed: %s", exc)
         try:
             self._ca.put(f"{self._prefix}cam1:TriggerSoftware", 1, wait=False)
         except Exception:
@@ -352,14 +452,78 @@ class CamPluginProxy:
 
 
 class _FilePluginProxy:
+    """CA-backed proxy exposing the HDF5/TIFF plugin surface the GUI needs.
+
+    In-process, the GUI reaches into the plugin instance for state like
+    _capturing / _frames_captured / _write_queue. In subprocess mode we
+    approximate those via CA reads (Capture_RBV, NumCaptured_RBV) and
+    provide harmless stubs for the internals the GUI displays.
+    """
+
     def __init__(self, ca: _CAHelper, prefix: str, sub: str):
+        self._ca = ca
+        self._pv_base = f"{prefix}{sub}"
+        # Public PV fields (used by GUI via ._data['value'])
         self.FilePath = _CAField(ca, f"{prefix}{sub}:FilePath", "/tmp/detector/", str)
+        self.FilePath_RBV = _CAField(
+            ca, f"{prefix}{sub}:FilePath_RBV", "/tmp/detector/", str)
+        self.FilePathExists_RBV = _CAField(
+            ca, f"{prefix}{sub}:FilePathExists_RBV", 0, int)
         self.FileName = _CAField(ca, f"{prefix}{sub}:FileName", "scan", str)
+        self.FileName_RBV = _CAField(ca, f"{prefix}{sub}:FileName_RBV", "scan", str)
         self.FileNumber = _CAField(ca, f"{prefix}{sub}:FileNumber", 1, int)
         self.Capture = _CAField(ca, f"{prefix}{sub}:Capture", 0, int)
         self.NumCapture = _CAField(ca, f"{prefix}{sub}:NumCapture", 1000, int)
         self.NumCaptured_RBV = _CAField(
             ca, f"{prefix}{sub}:NumCaptured_RBV", 0, int)
+        self.FullFileName_RBV = _CAField(
+            ca, f"{prefix}{sub}:FullFileName_RBV", "", str)
+        # Internal-state stubs used by qt_gui.py in-process paths. In
+        # subprocess mode the plugin's actual queue / byte counters live
+        # in the driver process; we surface what we can via CA and
+        # zero the rest.
+        self._write_queue = None
+        self._frame_bytes = 0
+        self._dropped_frames = 0
+        self._frames_received = 0
+
+    @property
+    def _capturing(self) -> bool:
+        # Capture PV: 0=Done, 1=Capture. Any non-zero → capturing.
+        try:
+            return bool(self._read_int("Capture_RBV")
+                        or self._read_int("Capture"))
+        except Exception:
+            return False
+
+    @property
+    def _frames_captured(self) -> int:
+        return self._read_int("NumCaptured_RBV") or 0
+
+    def _read_int(self, suffix: str) -> int:
+        try:
+            resp = self._ca.get(f"{self._pv_base}:{suffix}", timeout=0.5)
+            v = _decode_ca_value(resp)
+            return int(v) if v is not None else 0
+        except Exception:
+            return 0
+
+    def _start_capture(self) -> None:
+        try:
+            self._ca.put(f"{self._pv_base}:Capture", 1, wait=False)
+        except Exception as exc:
+            logger.debug("start_capture(%s): %s", self._pv_base, exc)
+
+    def _stop_capture(self) -> None:
+        try:
+            self._ca.put(f"{self._pv_base}:Capture", 0, wait=False)
+        except Exception as exc:
+            logger.debug("stop_capture(%s): %s", self._pv_base, exc)
+
+    def _maybe_stop_capture(self) -> None:
+        # End-of-acquisition hook — no-op on the client side; the driver
+        # process's HDF5Plugin handles the auto-close on its own.
+        pass
 
 
 class _PvaServerProxy:

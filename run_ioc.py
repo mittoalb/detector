@@ -35,6 +35,9 @@ from caproto.server import run as caproto_run
 from detectors.core import registry
 
 
+from detectors.core.log_util import install_color_logging as _install_color_logging
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Multi-camera areaDetector EPICS IOC")
@@ -45,6 +48,9 @@ def main():
                              "If omitted, auto-detects.")
     parser.add_argument("--device-index", type=int, default=0,
                         help="Camera device index when multiple of same type")
+    parser.add_argument("--serial",
+                        help="Camera serial number (Spinnaker/Oryx). "
+                             "Takes precedence over --device-index.")
     parser.add_argument("--pva-pv",
                         help="PVA NTNDArray PV name "
                              "(default: {prefix}image1:ArrayData)")
@@ -61,9 +67,7 @@ def main():
                         help="Launch the Qt GUI alongside the IOC")
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    _install_color_logging(level=getattr(logging, args.log_level))
     # Silence caproto's per-connection chatter so real errors are visible
     for name in ("caproto", "caproto.ctx", "caproto.ch", "caproto.bcast",
                  "caproto.client", "caproto.circuit"):
@@ -84,7 +88,9 @@ def main():
     camera = None
     if args.camera:
         try:
-            camera = registry.create(args.camera, device_index=args.device_index)
+            extra = {"serial": args.serial} if args.serial else {}
+            camera = registry.create(args.camera,
+                                     device_index=args.device_index, **extra)
             camera.open()
             logger.info("Opened: %s", camera.display_name)
         except Exception as exc:

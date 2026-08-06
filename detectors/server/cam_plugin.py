@@ -54,13 +54,16 @@ class CamPlugin(PVGroup):
     BinY = pvproperty(value=1, dtype=int)
     BinY_RBV = pvproperty(value=1, dtype=int, read_only=True)
 
-    # Image size
-    SizeX = pvproperty(value=4432, dtype=int)
-    SizeX_RBV = pvproperty(value=4432, dtype=int, read_only=True)
-    SizeY = pvproperty(value=2368, dtype=int)
-    SizeY_RBV = pvproperty(value=2368, dtype=int, read_only=True)
-    MaxSizeX_RBV = pvproperty(value=4432, dtype=int, read_only=True)
-    MaxSizeY_RBV = pvproperty(value=2368, dtype=int, read_only=True)
+    # Image size — defaults are 0 on purpose. set_camera() populates the
+    # real values by asking the camera. If you see 0 in the GUI, that
+    # means set_camera never ran (or the poller isn't running) — that's
+    # the signal, not a Hamamatsu-shaped placeholder.
+    SizeX = pvproperty(value=0, dtype=int)
+    SizeX_RBV = pvproperty(value=0, dtype=int, read_only=True)
+    SizeY = pvproperty(value=0, dtype=int)
+    SizeY_RBV = pvproperty(value=0, dtype=int, read_only=True)
+    MaxSizeX_RBV = pvproperty(value=0, dtype=int, read_only=True)
+    MaxSizeY_RBV = pvproperty(value=0, dtype=int, read_only=True)
     MinX = pvproperty(value=0, dtype=int)
     MinY = pvproperty(value=0, dtype=int)
 
@@ -84,6 +87,22 @@ class CamPlugin(PVGroup):
 
     # Sensor
     SensorTemperature_RBV = pvproperty(value=0.0, dtype=float, read_only=True)
+    SensorCoolerStatus_RBV = pvproperty(value="Off", dtype=str, max_length=40,
+                                          read_only=True)
+    AcquisitionFrameRate_RBV = pvproperty(value=0.0, dtype=float, precision=3,
+                                            read_only=True)
+
+    # Extra areaDetector-standard params exposed for the GUI's Oryx tabs
+    OffsetX = pvproperty(value=0, dtype=int)
+    OffsetX_RBV = pvproperty(value=0, dtype=int, read_only=True)
+    OffsetY = pvproperty(value=0, dtype=int)
+    OffsetY_RBV = pvproperty(value=0, dtype=int, read_only=True)
+    TriggerActive = pvproperty(value="RisingEdge", dtype=str, max_length=40)
+    TriggerActive_RBV = pvproperty(value="RisingEdge", dtype=str, max_length=40,
+                                     read_only=True)
+    TriggerDelay = pvproperty(value=0.0, dtype=float, precision=6)
+    TriggerDelay_RBV = pvproperty(value=0.0, dtype=float, precision=6,
+                                    read_only=True)
 
     # Plugin support
     WaitForPlugins = pvproperty(value="No", dtype=str, max_length=40)
@@ -103,14 +122,15 @@ class CamPlugin(PVGroup):
                             enum_strings=["Projection", "FlatField",
                                            "DarkField"])
 
-    # NDArray output
+    # NDArray output — max_length caps the CA payload; sized for the
+    # largest sensor we currently support (Oryx 31 MP = 6464×4852).
     ArrayData = pvproperty(value=np.zeros(1, dtype=np.uint16),
-                           dtype=ChannelType.INT, max_length=4480 * 2368)
-    ArraySize0_RBV = pvproperty(value=4432, dtype=int, read_only=True)
-    ArraySize1_RBV = pvproperty(value=2368, dtype=int, read_only=True)
+                           dtype=ChannelType.INT, max_length=6464 * 4852)
+    ArraySize0_RBV = pvproperty(value=0, dtype=int, read_only=True)
+    ArraySize1_RBV = pvproperty(value=0, dtype=int, read_only=True)
     # tomoscan / areaDetector also use ArraySizeX_RBV / ArraySizeY_RBV
-    ArraySizeX_RBV = pvproperty(value=4432, dtype=int, read_only=True)
-    ArraySizeY_RBV = pvproperty(value=2368, dtype=int, read_only=True)
+    ArraySizeX_RBV = pvproperty(value=0, dtype=int, read_only=True)
+    ArraySizeY_RBV = pvproperty(value=0, dtype=int, read_only=True)
     NDimensions_RBV = pvproperty(value=2, dtype=int, read_only=True)
     ColorMode_RBV = pvproperty(value=0, dtype=int, read_only=True)
     DataType_RBV = pvproperty(value="UInt16", dtype=str, max_length=40, read_only=True)
@@ -129,6 +149,11 @@ class CamPlugin(PVGroup):
         # Use PVA image1:ArrayData for full-rate live viewing.
         self._array_data_max_fps = 5.0
         self._array_data_last_t = 0.0
+        # Background poller for read-only camera values (temp, cooler,
+        # achievable frame rate) — the GUI subprocess reads these via CA
+        # and displays them in its Status panel.
+        self._poller_thread: Optional[threading.Thread] = None
+        self._poller_stop = threading.Event()
 
     def set_camera(self, camera: Optional[BaseCamera]) -> None:
         """Bind a BaseCamera to this plugin."""
@@ -138,21 +163,42 @@ class CamPlugin(PVGroup):
         info = camera.get_info()
         self.Manufacturer_RBV._data["value"] = info.vendor
         self.Model_RBV._data["value"] = info.model
-        self.SizeX_RBV._data["value"] = info.sensor_width
-        self.SizeY_RBV._data["value"] = info.sensor_height
+        # MaxSizeX/Y ALWAYS reflect the physical sensor. SizeX/Y reflect the
+        # current ROI — read live below so the GUI shows what the camera is
+        # actually configured to, not "full sensor" when the ROI is smaller.
         self.MaxSizeX_RBV._data["value"] = info.sensor_width
         self.MaxSizeY_RBV._data["value"] = info.sensor_height
-        self.ArraySize0_RBV._data["value"] = info.sensor_width
-        self.ArraySize1_RBV._data["value"] = info.sensor_height
-        self.ArraySizeX_RBV._data["value"] = info.sensor_width
-        self.ArraySizeY_RBV._data["value"] = info.sensor_height
-        # Read live ExposureTime
-        try:
-            exp = camera.get_param("ExposureTime")
-            self.AcquireTime._data["value"] = float(exp)
-            self.AcquireTime_RBV._data["value"] = float(exp)
-        except Exception:
-            pass
+
+        # Live camera state: try each param, silently skip anything a given
+        # backend doesn't support (SubarrayHPos vs OffsetX, etc.).
+        for param, prop, prop_rbv, cast in [
+                ("ExposureTime", self.AcquireTime, self.AcquireTime_RBV, float),
+                ("Width", self.SizeX, self.SizeX_RBV, int),
+                ("Height", self.SizeY, self.SizeY_RBV, int),
+                ("OffsetX", self.OffsetX, self.OffsetX_RBV, int),
+                ("OffsetY", self.OffsetY, self.OffsetY_RBV, int),
+                ("BinningHorizontal", self.BinX, self.BinX_RBV, int),
+                ("BinningVertical", self.BinY, self.BinY_RBV, int),
+                ("PixelFormat", self.PixelFormat, self.PixelFormat_RBV, str),
+                ("TriggerActive", self.TriggerActive,
+                 self.TriggerActive_RBV, str),
+                ("TriggerDelay", self.TriggerDelay,
+                 self.TriggerDelay_RBV, float),
+        ]:
+            try:
+                v = cast(camera.get_param(param))
+                prop._data["value"] = v
+                prop_rbv._data["value"] = v
+            except Exception:
+                continue
+
+        # Array-size mirrors current ROI (or full sensor as a fallback)
+        w = int(self.SizeX_RBV._data.get("value") or info.sensor_width)
+        h = int(self.SizeY_RBV._data.get("value") or info.sensor_height)
+        self.ArraySize0_RBV._data["value"] = w
+        self.ArraySize1_RBV._data["value"] = h
+        self.ArraySizeX_RBV._data["value"] = w
+        self.ArraySizeY_RBV._data["value"] = h
         # Sync trigger PVs to the camera's actual state so GUI/EPICS clients
         # see the hardware defaults (TriggerSource=External etc.) on startup.
         try:
@@ -183,6 +229,66 @@ class CamPlugin(PVGroup):
     @ArrayCallbacks.startup
     async def ArrayCallbacks(self, instance, async_lib):
         self._async_loop = asyncio.get_running_loop()
+        # Kick off the RO poller once the IOC event loop exists — before
+        # this, self._publish is a no-op (no async loop to schedule onto).
+        self._start_status_poller()
+
+    def _start_status_poller(self) -> None:
+        if self._poller_thread is not None:
+            return
+        self._poller_stop.clear()
+        self._poller_thread = threading.Thread(
+            target=self._status_poller_loop, daemon=True)
+        self._poller_thread.start()
+
+    def _status_poller_loop(self) -> None:
+        """Poll camera RO values every second and publish to _RBV PVs.
+
+        Runs in the driver process so ca_proxy (in the GUI subprocess)
+        gets live values via CA — its Status panel reads these PVs.
+        Also refreshes ROI/binning/pixel-format because those can change
+        via non-GUI clients or via the backend's own logic.
+        """
+        while not self._poller_stop.is_set():
+            cam = self._camera
+            if cam is not None:
+                # Sensor readouts
+                self._publish_ro("SensorTemperature", self.SensorTemperature_RBV,
+                                   float)
+                self._publish_ro("SensorCoolerStatus", self.SensorCoolerStatus_RBV,
+                                   str)
+                self._publish_ro("AcquisitionFrameRate",
+                                   self.AcquisitionFrameRate_RBV, float)
+                # Trigger config
+                self._publish_ro("TriggerActive", self.TriggerActive_RBV, str)
+                self._publish_ro("TriggerDelay", self.TriggerDelay_RBV, float)
+                # ROI / format — reflect the camera's actual state
+                self._publish_ro("Width", self.SizeX_RBV, int)
+                self._publish_ro("Height", self.SizeY_RBV, int)
+                self._publish_ro("OffsetX", self.OffsetX_RBV, int)
+                self._publish_ro("OffsetY", self.OffsetY_RBV, int)
+                self._publish_ro("BinningHorizontal", self.BinX_RBV, int)
+                self._publish_ro("BinningVertical", self.BinY_RBV, int)
+                self._publish_ro("PixelFormat", self.PixelFormat_RBV, str)
+                # Exposure — may have been clamped by the camera to a legal
+                # value distinct from what the user asked for.
+                self._publish_ro("ExposureTime", self.AcquireTime_RBV, float)
+            # Polling every 1s matches the GUI's _refresh_timer cadence
+            self._poller_stop.wait(1.0)
+
+    def _publish_ro(self, param_name: str, prop, cast) -> None:
+        """Read one param from the camera, coerce, publish to a _RBV PV."""
+        try:
+            val = self._camera.get_param(param_name)
+        except Exception:
+            return
+        if val is None:
+            return
+        try:
+            val = cast(val)
+        except Exception:
+            return
+        self._publish(prop, val)
 
     @Acquire.putter
     async def Acquire(self, instance, value):
@@ -266,6 +372,83 @@ class CamPlugin(PVGroup):
     @FrameRateEnable.putter
     async def FrameRateEnable(self, instance, value):
         return int(value)
+
+    @SizeX.putter
+    async def SizeX(self, instance, value):
+        v = int(value)
+        if self._camera:
+            try:
+                self._camera.set_param("Width", v)
+            except Exception as exc:
+                logger.warning("Failed to set Width: %s", exc)
+        await self.SizeX_RBV.write(v)
+        return v
+
+    @SizeY.putter
+    async def SizeY(self, instance, value):
+        v = int(value)
+        if self._camera:
+            try:
+                self._camera.set_param("Height", v)
+            except Exception as exc:
+                logger.warning("Failed to set Height: %s", exc)
+        await self.SizeY_RBV.write(v)
+        return v
+
+    @OffsetX.putter
+    async def OffsetX(self, instance, value):
+        v = int(value)
+        if self._camera:
+            try:
+                self._camera.set_param("OffsetX", v)
+            except Exception as exc:
+                logger.warning("Failed to set OffsetX: %s", exc)
+        await self.OffsetX_RBV.write(v)
+        return v
+
+    @OffsetY.putter
+    async def OffsetY(self, instance, value):
+        v = int(value)
+        if self._camera:
+            try:
+                self._camera.set_param("OffsetY", v)
+            except Exception as exc:
+                logger.warning("Failed to set OffsetY: %s", exc)
+        await self.OffsetY_RBV.write(v)
+        return v
+
+    @TriggerActive.putter
+    async def TriggerActive(self, instance, value):
+        v = str(value)
+        if self._camera:
+            try:
+                self._camera.set_param("TriggerActive", v)
+            except Exception as exc:
+                logger.warning("Failed to set TriggerActive: %s", exc)
+        await self.TriggerActive_RBV.write(v)
+        return v
+
+    @TriggerDelay.putter
+    async def TriggerDelay(self, instance, value):
+        v = float(value)
+        if self._camera:
+            try:
+                self._camera.set_param("TriggerDelay", v)
+            except Exception as exc:
+                logger.warning("Failed to set TriggerDelay: %s", exc)
+        await self.TriggerDelay_RBV.write(v)
+        return v
+
+    @PixelFormat.putter
+    async def PixelFormat(self, instance, value):
+        v = str(value)
+        if self._camera:
+            try:
+                self._camera.set_param("PixelFormat", v)
+            except Exception as exc:
+                logger.warning("Failed to set PixelFormat: %s", exc)
+        await self.PixelFormat_RBV.write(v)
+        return v
 
     @BinX.putter
     async def BinX(self, instance, value):
