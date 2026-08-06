@@ -913,10 +913,13 @@ class TeledyneKinetix(BaseCamera):
 
         # Register EOF callback right before pl_exp_start_cont — this
         # ordering is the one that actually delivers callbacks (verified
-        # via /tmp/kinetix_minimal.py). Registering earlier (e.g. at open)
-        # doesn't crash but callbacks never fire. Keep a Python-side ref
-        # to the CFUNCTYPE object so it isn't GC'd out from under PVCAM.
-        self._callback_ref = PVCAM_CALLBACK(self._on_eof)
+        # via /tmp/kinetix_minimal.py). Use a plain nested function (not
+        # a bound method wrapping); bound-method callbacks silently
+        # never fire on some ctypes / PVCAM combos. Keep a Python-side
+        # ref to the CFUNCTYPE object so it isn't GC'd.
+        def _eof_thunk(p_frame_info, p_context):
+            self._on_eof(p_frame_info, p_context)
+        self._callback_ref = PVCAM_CALLBACK(_eof_thunk)
         if _pvcam_lib.pl_cam_register_callback_ex3(
                 self._hcam, PL_CALLBACK_EOF,
                 ctypes.cast(self._callback_ref, ctypes.c_void_p), None) != PV_OK:
