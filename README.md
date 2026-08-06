@@ -42,6 +42,20 @@ interface — every backend implements `open`, `close`, `get_param`, `set_param`
 Backends self-register via the `@register` decorator. Adding a new camera is
 a single new file in `detectors/cameras/<vendor>/`.
 
+### GUI process model
+
+With `--gui`, `run_ioc.py` launches the Qt GUI as a **separate process** that
+connects to the IOC via ChannelAccess and pvAccess. The GUI talks to the IOC
+purely over the network (`caproto.threading.client` + `pvaccess`) through a
+proxy layer (`detectors/gui/ca_proxy.py`) that mirrors the in-process IOC
+interface the GUI was written against.
+
+Why: some vendor drivers (notably Photometrics PVCAM used by the Kinetix
+backend) install signal handlers that Qt's `QApplication` clobbers when they
+share a process. In-process Qt then silently starves the camera's DMA loop.
+Running Qt in its own process side-steps this uniformly for every backend —
+no per-camera branching in the launcher, no threading hacks.
+
 ## Installation
 
 ### Base requirements
@@ -60,7 +74,7 @@ pip install imageio  # optional, for TIFF export
 | `hamamatsu.orca_fire_dcam` | DCAM-API Lite for Linux + FireBird kernel driver. See `firebird-driver-rhel9-patch/README.md` |
 | `hamamatsu.orca_fire_gentl` | `pip install harvesters` + Euresys eGrabber |
 | `teledyne.oryx` | Spinnaker SDK + `pip install spinnaker-python` |
-| `teledyne.kinetix` | PVCAM + `pip install pyvcam` |
+| `teledyne.kinetix` | PVCAM SDK (`libpvcam.so.2`) — no Python bindings required, direct ctypes |
 | `tucsen.libra_5514pro` | TUCAM SDK from Tucsen |
 
 ## Running
@@ -206,12 +220,36 @@ detectors/
 │   ├── hdf5_plugin.py       # HDF1: PVs
 │   └── ntnda_server.py      # PVAccess NTNDArray
 └── gui/
-    └── qt_gui.py            # Camera-agnostic Qt GUI
+    ├── qt_gui.py            # Camera-agnostic Qt GUI (also standalone entry:
+    │                        #   `python -m detectors.gui.qt_gui --prefix P:`)
+    └── ca_proxy.py          # CA/PVA-backed IocProxy — lets qt_gui.py run
+                             # against just an IOC prefix (subprocess mode)
 
 run_ioc.py                   # Main entry point
 check_environment.py         # Environment / hardware checker
 firebird-driver-rhel9-patch/ # Patched Active Silicon driver source
 ```
+
+## PVCAM (Kinetix) notes
+
+Direct-`ctypes` binding to `libpvcam.so.2`. No `pyvcam` dependency.
+
+- The library is picked up from `LD_LIBRARY_PATH` first, then falls back to
+  the vendor path shipped with ADKinetix
+  (`/opt/pvcam/library/x86_64/libpvcam.so.2` on typical installs).
+- PVCAM claims the camera exclusively — stop any running ADKinetix C++ IOC
+  before starting this Python one.
+- On the first open, the backend calls `pl_pp_reset`, forces `PARAM_EXP_RES`
+  to microseconds (Kinetix defaults to seconds — 10 ms exposure would round
+  to 0), selects a valid speed-table entry, and runs one prime setup+start+stop
+  cycle. Without any of these, `pl_exp_start_cont` returns silently with
+  `PL_ERR_CONFIGURATION_INVALID` or `PL_ERR_NONE`.
+- Acquisition uses the standard PVCAM EOF callback registered on the main
+  thread, with a `threading.Event` handoff so `acquire_frame()` releases the
+  GIL while waiting for the next frame — same pattern DCAM uses via
+  `dcamwait_start`.
+- Device ACL: `/dev/pvcamPCIE_0` typically has `group: users`. Users not in
+  that group need an explicit ACL entry (`setfacl -m u:<user>:rw`).
 
 ## DCAM (Hamamatsu) notes
 
