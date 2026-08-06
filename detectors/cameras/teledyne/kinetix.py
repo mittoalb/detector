@@ -964,6 +964,10 @@ class TeledyneKinetix(BaseCamera):
 
     def _on_eof(self, p_frame_info, p_context) -> None:
         """PVCAM EOF callback (runs on PVCAM's thread). Never block here."""
+        # Diagnostic: prove the callback is firing. Remove once verified.
+        self._cb_fire_count = getattr(self, "_cb_fire_count", 0) + 1
+        if self._cb_fire_count <= 3 or self._cb_fire_count % 100 == 0:
+            logger.info("EOF fired #%d", self._cb_fire_count)
         try:
             ptr = ctypes.c_void_p()
             if _pvcam_lib.pl_exp_get_latest_frame(
