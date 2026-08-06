@@ -26,6 +26,64 @@ from caproto.threading.client import Context as CAContext
 logger = logging.getLogger(__name__)
 
 
+def _decode_ca_value(resp):
+    """Turn a caproto ReadResponse into a Python scalar.
+
+    - Regular numeric PVs: `.data` is a length-1 array; return element 0.
+    - String PVs: `.data` may be a plain bytes/str, or an array of byte
+      integers (char codes). We coalesce into a Python str.
+    - Enum PVs: `.data` is a length-1 int index — return the string label
+      from `.metadata.enum_strings` if present, else the raw int.
+    """
+    if resp is None:
+        return None
+    data = getattr(resp, "data", resp)
+
+    # Bytes → str
+    if isinstance(data, (bytes, bytearray)):
+        return data.decode("utf-8", errors="replace").rstrip("\x00")
+
+    # Array/list — could be a char array (string PV) or scalar wrapped in a list
+    try:
+        length = len(data)
+    except TypeError:
+        return data
+
+    if length == 0:
+        return None
+
+    # Single-element scalar (numeric or single-char)
+    if length == 1:
+        v = data[0]
+        # Enum PV: metadata carries the string labels
+        meta = getattr(resp, "metadata", None)
+        enum_strings = getattr(meta, "enum_strings", None) if meta else None
+        if enum_strings:
+            try:
+                s = enum_strings[int(v)]
+                if isinstance(s, bytes):
+                    s = s.decode("utf-8", errors="replace")
+                return s
+            except Exception:
+                pass
+        if isinstance(v, bytes):
+            v = v.decode("utf-8", errors="replace").rstrip("\x00")
+        return v
+
+    # Multi-element: for CA string PVs served by caproto this is a
+    # sequence of small ints (char codes) representing one string.
+    # Coerce each element via int() to handle numpy scalar types.
+    try:
+        as_ints = [int(c) & 0xFF for c in data]
+        s = bytes(as_ints).decode("utf-8", errors="replace").rstrip("\x00")
+        # Only treat as a string if it's printable ASCII/UTF-8
+        if s and all(ord(ch) >= 9 for ch in s):
+            return s
+    except Exception:
+        pass
+    return data
+
+
 class _CAField:
     """`.FooPV._data['value']` accessor backed by CA."""
 
@@ -54,9 +112,7 @@ class _CADataDict:
             raise KeyError(key)
         try:
             resp = self._ca.get(self._pvname, timeout=0.5)
-            v = resp.data[0] if hasattr(resp, "data") else resp
-            if isinstance(v, bytes):
-                v = v.decode("utf-8", errors="replace")
+            v = _decode_ca_value(resp)
             if self._cast is not None:
                 try:
                     v = self._cast(v)
@@ -176,9 +232,7 @@ class CameraProxy:
     def _safe_get(self, pv_short, default=None, cast=None):
         try:
             resp = self._ca.get(f"{self._prefix}{pv_short}", timeout=0.5)
-            v = resp.data[0] if hasattr(resp, "data") else resp
-            if isinstance(v, bytes):
-                v = v.decode("utf-8", errors="replace")
+            v = _decode_ca_value(resp)
             if cast is not None:
                 try:
                     v = cast(v)
@@ -223,13 +277,14 @@ class CamPluginProxy:
 
     def _start_acquisition(self) -> None:
         try:
-            self._ca.put(f"{self._prefix}cam1:Acquire", "Acquire", wait=False)
+            # Enum PV — write the numeric index (1 = "Acquire")
+            self._ca.put(f"{self._prefix}cam1:Acquire", 1, wait=False)
         except Exception as exc:
             logger.error("Failed to start acquisition: %s", exc)
 
     def _stop_acquisition(self) -> None:
         try:
-            self._ca.put(f"{self._prefix}cam1:Acquire", "Done", wait=False)
+            self._ca.put(f"{self._prefix}cam1:Acquire", 0, wait=False)
         except Exception as exc:
             logger.error("Failed to stop acquisition: %s", exc)
 

@@ -64,9 +64,10 @@ def main():
     logging.basicConfig(
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    # Silence caproto's per-connection chatter so kinetix errors are visible
-    logging.getLogger("caproto").setLevel(logging.WARNING)
-    logging.getLogger("caproto.ctx").setLevel(logging.WARNING)
+    # Silence caproto's per-connection chatter so real errors are visible
+    for name in ("caproto", "caproto.ctx", "caproto.ch", "caproto.bcast",
+                 "caproto.client", "caproto.circuit"):
+        logging.getLogger(name).setLevel(logging.WARNING)
     logger = logging.getLogger(__name__)
 
     # Load all available backends
@@ -119,13 +120,20 @@ def main():
         # Qt in the SAME process as the camera driver breaks PVCAM's DMA
         # signalling (Kinetix); process isolation avoids that entirely,
         # and is uniform across all camera backends.
+        import os
         import subprocess
         logger.info("Launching Qt GUI as subprocess (--prefix %s)",
                     args.prefix)
+        # Ensure the subprocess can import `detectors.*` regardless of
+        # the shell's cwd — the package lives next to this script.
+        pkg_root = os.path.dirname(os.path.abspath(__file__))
+        env = os.environ.copy()
+        env["PYTHONPATH"] = pkg_root + os.pathsep + env.get("PYTHONPATH", "")
         gui_proc = subprocess.Popen(
             [sys.executable, "-m", "detectors.gui.qt_gui",
              "--prefix", args.prefix,
-             "--log-level", args.log_level])
+             "--log-level", args.log_level],
+            env=env)
 
         logger.info("Serving %d PVs on %s", len(ioc.pvdb), args.interfaces)
         try:

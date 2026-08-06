@@ -881,6 +881,9 @@ def main():
     logging.basicConfig(
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    for name in ("caproto", "caproto.ctx", "caproto.ch", "caproto.bcast",
+                 "caproto.client", "caproto.circuit"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
     from detectors.gui.ca_proxy import IocProxy
 
