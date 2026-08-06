@@ -302,6 +302,10 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
     lib.pl_error_message.argtypes = [int16, ctypes.c_char_p]
     lib.pl_pp_reset.restype = rs_bool
     lib.pl_pp_reset.argtypes = [int16]
+    lib.pl_exp_check_cont_status.restype = rs_bool
+    lib.pl_exp_check_cont_status.argtypes = [
+        int16, ctypes.POINTER(int16),
+        ctypes.POINTER(uns32), ctypes.POINTER(uns32)]
 
 
 def _last_pvcam_error() -> str:
@@ -369,6 +373,13 @@ class TeledyneKinetix(BaseCamera):
         # Last pointer returned by pl_exp_get_latest_frame — used to
         # detect fresh frames in the polling acquire_frame().
         self._last_frame_ptr: int = 0
+        # Last buffer count from pl_exp_check_cont_status — detects new frames
+        self._last_buffer_cnt: int = 0
+        # Callback -> acquire_frame handoff (mutable boxes for the C closure)
+        self._frame_event = threading.Event()
+        self._latest_ptr_ref = [0]
+        self._frame_counter_ref = [0]
+        self._last_frame_counter: int = 0
 
     # -----------------------------------------------------------------------
     # Lifecycle
@@ -492,6 +503,31 @@ class TeledyneKinetix(BaseCamera):
         self._exp_mode = EXPOSURE_MODE["Internal"]
         # Default 10 ms exposure in current EXP_RES units
         self._exposure_time_units = int(round(0.010 / self._exposure_scale_to_seconds()))
+
+        # Prime the acquisition subsystem with one setup+start+stop cycle
+        # on the CURRENT thread (the same one that did pvcam_init). Without
+        # this, subsequent pl_exp_start_cont calls from other threads
+        # return OK but DMA never starts (status=0, buffer_cnt=0). This
+        # matches an observed working pattern where the first start_cont
+        # must happen on the init thread.
+        try:
+            prime_rgn = rgn_type(0, ser - 1, 1, 0, par - 1, 1)
+            prime_bytes = uns32()
+            if _pvcam_lib.pl_exp_setup_cont(
+                    self._hcam, 1, ctypes.byref(prime_rgn),
+                    int16(self._exp_mode | EXPOSE_OUT_MODE["FirstRow"]),
+                    uns32(self._exposure_time_units),
+                    ctypes.byref(prime_bytes),
+                    int16(CIRC_OVERWRITE)) == PV_OK:
+                prime_buf = (ctypes.c_uint8 * (prime_bytes.value * 2))()
+                prime_ptr = ctypes.cast(prime_buf, ctypes.c_void_p)
+                if _pvcam_lib.pl_exp_start_cont(
+                        self._hcam, prime_ptr,
+                        uns32(prime_bytes.value * 2)) == PV_OK:
+                    logger.info("Primed acquisition subsystem")
+                _pvcam_lib.pl_exp_stop_cont(self._hcam, int16(CCS_HALT))
+        except Exception as exc:
+            logger.warning("Prime cycle failed (harmless): %s", exc)
 
         logger.info("Opened %s SN=%s (%dx%d, %d-bit)",
                     self.display_name, serial, ser, par, bpc)
@@ -896,11 +932,12 @@ class TeledyneKinetix(BaseCamera):
         self._exp_bytes = int(exp_bytes.value)
 
         buf_bytes = self._exp_bytes * self.NUM_BUFFERS
-        # Use numpy for the circular buffer — page-aligned by default,
-        # which the pvcam_pcie kernel driver needs for direct DMA mapping
-        # (see `dmesg | grep pvcam` — "mapping user buffer directly for DMA").
-        self._circ_buf = np.zeros(buf_bytes, dtype=np.uint8)
-        buf_ptr = self._circ_buf.ctypes.data_as(ctypes.c_void_p)
+        # Plain ctypes array (matches /tmp/kinetix_minimal.py, which works).
+        # An earlier numpy-based allocation left status=0/buffer_cnt=0
+        # even though pl_exp_start_cont returned OK — PVCAM apparently
+        # needs the exact ctypes-owned buffer layout for DMA to engage.
+        self._circ_buf = (ctypes.c_uint8 * buf_bytes)()
+        buf_ptr = ctypes.cast(self._circ_buf, ctypes.c_void_p)
 
         # Drain any stale frames from a previous run
         while not self._frame_queue.empty():
@@ -915,13 +952,45 @@ class TeledyneKinetix(BaseCamera):
                     self._exp_bytes, self.NUM_BUFFERS, buf_bytes,
                     buf_ptr.value or 0)
 
+        # Register EOF callback that signals a threading.Event when a
+        # frame is ready. acquire_frame() then waits on the event —
+        # Event.wait() releases the GIL, letting Qt / caproto run
+        # unhindered. This is the PVCAM analog of DCAM's dcamwait_start.
+        hcam_local = self._hcam
+        frame_event = self._frame_event
+        latest_ptr_ref = self._latest_ptr_ref
+        frame_counter_ref = self._frame_counter_ref
+
+        def _eof_cb(p_frame_info, p_context):
+            ptr = ctypes.c_void_p()
+            if (_pvcam_lib.pl_exp_get_latest_frame(
+                    hcam_local, ctypes.byref(ptr)) == PV_OK
+                    and ptr.value):
+                latest_ptr_ref[0] = ptr.value
+                frame_counter_ref[0] += 1
+                frame_event.set()
+
+        self._callback_ref = PVCAM_CALLBACK(_eof_cb)
+        if _pvcam_lib.pl_cam_register_callback_ex3(
+                self._hcam, PL_CALLBACK_EOF,
+                ctypes.cast(self._callback_ref, ctypes.c_void_p), None) != PV_OK:
+            self._circ_buf = None
+            self._callback_ref = None
+            raise RuntimeError(
+                f"pl_cam_register_callback_ex3: {_last_pvcam_error()}")
+
         if _pvcam_lib.pl_exp_start_cont(
                 self._hcam, buf_ptr, uns32(buf_bytes)) != PV_OK:
             self._circ_buf = None
+            self._callback_ref = None
             raise RuntimeError(
                 f"pl_exp_start_cont: {_last_pvcam_error()}")
-        # Reset last-seen frame pointer for polling
+        # Reset polling/callback state
         self._last_frame_ptr = 0
+        self._last_buffer_cnt = 0
+        self._frame_counter_ref[0] = 0
+        self._last_frame_counter = 0
+        self._frame_event.clear()
 
         self._is_acquiring = True
         logger.info("Acquisition started")
@@ -933,17 +1002,24 @@ class TeledyneKinetix(BaseCamera):
             _pvcam_lib.pl_exp_stop_cont(self._hcam, int16(CCS_HALT))
         except Exception:
             pass
+        try:
+            _pvcam_lib.pl_cam_deregister_callback(
+                self._hcam, PL_CALLBACK_EOF)
+        except Exception:
+            pass
+        self._callback_ref = None
         self._circ_buf = None
         self._is_acquiring = False
+        # Wake any waiting acquire_frame so it can exit cleanly
+        self._frame_event.set()
         logger.info("Acquisition stopped")
 
     def acquire_frame(self, timeout_ms: int = 5000) -> np.ndarray:
-        """Poll pl_exp_get_latest_frame until a new frame arrives.
+        """Block on threading.Event set by the EOF callback.
 
-        Polling (rather than PVCAM's EOF callback) sidesteps a ctypes
-        threading issue where CFUNCTYPE callbacks don't fire when
-        pl_exp_start_cont is called from a non-main thread — which is
-        the IOC's normal acquisition-loop pattern.
+        Event.wait() releases the GIL while blocking, letting Qt and
+        caproto run — analog of DCAM's dcamwait_start (which also
+        releases the GIL). This is what makes --gui work.
         """
         if not self._is_acquiring:
             raise RuntimeError("Acquisition not running")
@@ -952,19 +1028,27 @@ class TeledyneKinetix(BaseCamera):
         n_pixels = h * w
         buf_type = ctypes.c_uint16 * n_pixels
         while True:
-            ptr = ctypes.c_void_p()
-            if (_pvcam_lib.pl_exp_get_latest_frame(
-                    self._hcam, ctypes.byref(ptr)) == PV_OK
-                    and ptr.value
-                    and ptr.value != self._last_frame_ptr):
-                self._last_frame_ptr = ptr.value
-                src = buf_type.from_address(ptr.value)
-                arr = np.frombuffer(src, dtype=np.uint16).reshape((h, w)).copy()
-                self._last_metadata = {}
-                return arr
-            if time.monotonic() > deadline:
-                raise RuntimeError(f"acquire_frame timed out after {timeout_ms} ms")
-            time.sleep(0.001)  # 1ms poll — plenty for 40fps free-run
+            # Only take frames the callback signalled AFTER the previous
+            # acquire_frame returned — otherwise we'd re-read the same
+            # buffer over and over.
+            if self._frame_counter_ref[0] > self._last_frame_counter:
+                self._last_frame_counter = self._frame_counter_ref[0]
+                ptr_val = self._latest_ptr_ref[0]
+                if ptr_val:
+                    src = buf_type.from_address(ptr_val)
+                    arr = np.frombuffer(src, dtype=np.uint16).reshape(
+                        (h, w)).copy()
+                    self._last_metadata = {
+                        "frame_number": self._last_frame_counter}
+                    return arr
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"acquire_frame timed out after {timeout_ms} ms "
+                    f"(frame_counter={self._frame_counter_ref[0]})")
+            # Event.wait(timeout) releases GIL — Qt/caproto run.
+            self._frame_event.wait(timeout=min(remaining, 0.05))
+            self._frame_event.clear()
 
     def _on_eof(self, p_frame_info, p_context) -> None:
         """PVCAM EOF callback (runs on PVCAM's thread). Never block here."""
