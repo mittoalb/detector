@@ -20,6 +20,7 @@ import ctypes
 import logging
 import queue
 import threading
+import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -365,6 +366,9 @@ class TeledyneKinetix(BaseCamera):
         # and apply on the next start_acquisition().
         self._exposure_time_units: int = 10000   # populated in open()
         self._exp_mode: int = EXPOSURE_MODE["Internal"]
+        # Last pointer returned by pl_exp_get_latest_frame — used to
+        # detect fresh frames in the polling acquire_frame().
+        self._last_frame_ptr: int = 0
 
     # -----------------------------------------------------------------------
     # Lifecycle
@@ -911,72 +915,13 @@ class TeledyneKinetix(BaseCamera):
                     self._exp_bytes, self.NUM_BUFFERS, buf_bytes,
                     buf_ptr.value or 0)
 
-        # Register EOF callback right before pl_exp_start_cont — this
-        # ordering is what actually delivers callbacks (verified via
-        # /tmp/kinetix_minimal.py). Inline the entire callback body here
-        # to match the minimal exactly: no self-method indirection.
-        hcam_local = self._hcam
-        frame_queue = self._frame_queue
-        frame_shape_ref = [self._frame_shape]  # mutable box for updates
-        num_bufs = self.NUM_BUFFERS
-        cb_counter = [0]
-
-        def _eof_thunk(p_frame_info, p_context):
-            cb_counter[0] += 1
-            n = cb_counter[0]
-            if n <= 3 or n % 200 == 0:
-                # print(), not logger — logger locks can hide callbacks
-                print(f"[kinetix] EOF #{n}", flush=True)
-            ptr = ctypes.c_void_p()
-            if _pvcam_lib.pl_exp_get_latest_frame(
-                    hcam_local, ctypes.byref(ptr)) != PV_OK or not ptr.value:
-                return
-            h, w = frame_shape_ref[0]
-            n_pixels = h * w
-            buf_type = ctypes.c_uint16 * n_pixels
-            try:
-                src = buf_type.from_address(ptr.value)
-                arr = np.frombuffer(src, dtype=np.uint16).reshape((h, w)).copy()
-            except Exception as exc:
-                print(f"[kinetix] frame decode error: {exc}", flush=True)
-                return
-            meta = {}
-            if p_frame_info:
-                fi = ctypes.cast(
-                    p_frame_info, ctypes.POINTER(FRAME_INFO)).contents
-                meta = {"frame_number": int(fi.FrameNr),
-                        "timestamp": int(fi.TimeStamp),
-                        "readout_time": int(fi.ReadoutTime)}
-            if frame_queue.full():
-                try:
-                    frame_queue.get_nowait()
-                except queue.Empty:
-                    pass
-            try:
-                frame_queue.put_nowait((arr, meta))
-            except queue.Full:
-                pass
-
-        self._callback_ref = PVCAM_CALLBACK(_eof_thunk)
-        if _pvcam_lib.pl_cam_register_callback_ex3(
-                self._hcam, PL_CALLBACK_EOF,
-                ctypes.cast(self._callback_ref, ctypes.c_void_p), None) != PV_OK:
-            self._circ_buf = None
-            self._callback_ref = None
-            raise RuntimeError(
-                f"pl_cam_register_callback_ex3: {_last_pvcam_error()}")
-
         if _pvcam_lib.pl_exp_start_cont(
                 self._hcam, buf_ptr, uns32(buf_bytes)) != PV_OK:
-            try:
-                _pvcam_lib.pl_cam_deregister_callback(
-                    self._hcam, PL_CALLBACK_EOF)
-            except Exception:
-                pass
-            self._callback_ref = None
             self._circ_buf = None
             raise RuntimeError(
                 f"pl_exp_start_cont: {_last_pvcam_error()}")
+        # Reset last-seen frame pointer for polling
+        self._last_frame_ptr = 0
 
         self._is_acquiring = True
         logger.info("Acquisition started")
@@ -988,25 +933,38 @@ class TeledyneKinetix(BaseCamera):
             _pvcam_lib.pl_exp_stop_cont(self._hcam, int16(CCS_HALT))
         except Exception:
             pass
-        try:
-            _pvcam_lib.pl_cam_deregister_callback(
-                self._hcam, PL_CALLBACK_EOF)
-        except Exception:
-            pass
-        self._callback_ref = None
         self._circ_buf = None
         self._is_acquiring = False
         logger.info("Acquisition stopped")
 
     def acquire_frame(self, timeout_ms: int = 5000) -> np.ndarray:
+        """Poll pl_exp_get_latest_frame until a new frame arrives.
+
+        Polling (rather than PVCAM's EOF callback) sidesteps a ctypes
+        threading issue where CFUNCTYPE callbacks don't fire when
+        pl_exp_start_cont is called from a non-main thread — which is
+        the IOC's normal acquisition-loop pattern.
+        """
         if not self._is_acquiring:
             raise RuntimeError("Acquisition not running")
-        try:
-            frame, meta = self._frame_queue.get(timeout=timeout_ms / 1000.0)
-        except queue.Empty:
-            raise RuntimeError(f"acquire_frame timed out after {timeout_ms} ms")
-        self._last_metadata = meta
-        return frame
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        h, w = self._frame_shape
+        n_pixels = h * w
+        buf_type = ctypes.c_uint16 * n_pixels
+        while True:
+            ptr = ctypes.c_void_p()
+            if (_pvcam_lib.pl_exp_get_latest_frame(
+                    self._hcam, ctypes.byref(ptr)) == PV_OK
+                    and ptr.value
+                    and ptr.value != self._last_frame_ptr):
+                self._last_frame_ptr = ptr.value
+                src = buf_type.from_address(ptr.value)
+                arr = np.frombuffer(src, dtype=np.uint16).reshape((h, w)).copy()
+                self._last_metadata = {}
+                return arr
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"acquire_frame timed out after {timeout_ms} ms")
+            time.sleep(0.001)  # 1ms poll — plenty for 40fps free-run
 
     def _on_eof(self, p_frame_info, p_context) -> None:
         """PVCAM EOF callback (runs on PVCAM's thread). Never block here."""
