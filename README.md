@@ -1,8 +1,8 @@
 # Multi-Camera Area Detector Control
 
 Camera-agnostic EPICS areaDetector IOC and Qt GUI for scientific cameras.
-Currently supports Hamamatsu, Teledyne, and Tucsen — adding new camera types
-is a single-file addition.
+Currently supports Hamamatsu and Teledyne — adding new camera types is a
+single-file addition.
 
 ## Supported Cameras
 
@@ -12,7 +12,6 @@ is a single-file addition.
 | `hamamatsu.orca_fire_gentl` | Hamamatsu ORCA Fire C16240-20UP | Harvesters/GenTL + Euresys Coaxlink |
 | `teledyne.oryx` | Teledyne FLIR Oryx (CXP) | Spinnaker SDK + PySpin |
 | `teledyne.kinetix` | Teledyne Photometrics Kinetix | PVCAM + PyVCAM |
-| `tucsen.libra_5514pro` | Tucsen Libra 5514 Pro | TUCAM SDK (skeleton) |
 | `simulator` | Synthetic frames | none — built in |
 
 ## Architecture
@@ -28,11 +27,11 @@ is a single-file addition.
                            ▼
        ┌───────────────────────────────────────┐
        │   Camera Registry (auto/explicit)     │
-       └─────┬─────────┬─────────┬─────────┬───┘
-             ▼         ▼         ▼         ▼
-        Hamamatsu Teledyne   Tucsen   Simulator
-         DCAM    Spinnaker   TUCAM
-       (ORCA Fire) (Oryx)  (Libra 5514)
+       └─────┬─────────┬─────────┬─────────────┘
+             ▼         ▼         ▼
+        Hamamatsu Teledyne   Simulator
+         DCAM   Spinnaker/PVCAM
+       (ORCA Fire) (Oryx/Kinetix)
 ```
 
 The `BaseCamera` abstract class (`detectors/core/base.py`) defines a uniform
@@ -75,7 +74,6 @@ pip install imageio  # optional, for TIFF export
 | `hamamatsu.orca_fire_gentl` | `pip install harvesters` + Euresys eGrabber |
 | `teledyne.oryx` | Spinnaker SDK + `pip install spinnaker-python` |
 | `teledyne.kinetix` | PVCAM SDK (`libpvcam.so.2`) — no Python bindings required, direct ctypes |
-| `tucsen.libra_5514pro` | TUCAM SDK from Tucsen |
 
 ## Running
 
@@ -211,8 +209,6 @@ detectors/
 │   ├── teledyne/
 │   │   ├── oryx.py               # Oryx via Spinnaker
 │   │   └── kinetix.py            # Kinetix via PVCAM
-│   ├── tucsen/
-│   │   └── libra.py              # Libra 5514 Pro (skeleton)
 │   └── simulator.py              # Built-in simulator
 ├── server/
 │   ├── ioc.py               # DetectorIOC (top-level)

@@ -91,7 +91,6 @@ def load_all() -> None:
         "detectors.cameras.hamamatsu.orca_fire_gentl",
         "detectors.cameras.teledyne.oryx",
         "detectors.cameras.teledyne.kinetix",
-        "detectors.cameras.tucsen.libra",
         "detectors.cameras.simulator",
     ]
     for mod in modules:
