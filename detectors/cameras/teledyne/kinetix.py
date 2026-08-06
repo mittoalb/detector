@@ -489,21 +489,6 @@ class TeledyneKinetix(BaseCamera):
         # Default 10 ms exposure in current EXP_RES units
         self._exposure_time_units = int(round(0.010 / self._exposure_scale_to_seconds()))
 
-        # Register EOF callback ONCE for the camera's lifetime — matches
-        # the C++ driver (ADKinetix.cpp:676). Registering/deregistering
-        # per acquisition works on some PVCAM versions and fails silently
-        # (returning PV_FAIL with PL_ERR_NONE) on others. Keep the
-        # CFUNCTYPE reference alive so it isn't GC'd.
-        self._callback_ref = PVCAM_CALLBACK(self._on_eof)
-        cb_ok = _pvcam_lib.pl_cam_register_callback_ex3(
-            self._hcam, PL_CALLBACK_EOF,
-            ctypes.cast(self._callback_ref, ctypes.c_void_p), None)
-        if cb_ok != PV_OK:
-            logger.warning("pl_cam_register_callback_ex3 failed: %s",
-                           _last_pvcam_error())
-        else:
-            logger.info("EOF callback registered")
-
         logger.info("Opened %s SN=%s (%dx%d, %d-bit)",
                     self.display_name, serial, ser, par, bpc)
 
@@ -514,11 +499,6 @@ class TeledyneKinetix(BaseCamera):
             except Exception:
                 pass
         if self._hcam is not None:
-            try:
-                _pvcam_lib.pl_cam_deregister_callback(
-                    self._hcam, PL_CALLBACK_EOF)
-            except Exception:
-                pass
             try:
                 _pvcam_lib.pl_cam_close(self._hcam)
             except Exception:
@@ -931,8 +911,28 @@ class TeledyneKinetix(BaseCamera):
                     self._exp_bytes, self.NUM_BUFFERS, buf_bytes,
                     buf_ptr.value or 0)
 
+        # Register EOF callback right before pl_exp_start_cont — this
+        # ordering is the one that actually delivers callbacks (verified
+        # via /tmp/kinetix_minimal.py). Registering earlier (e.g. at open)
+        # doesn't crash but callbacks never fire. Keep a Python-side ref
+        # to the CFUNCTYPE object so it isn't GC'd out from under PVCAM.
+        self._callback_ref = PVCAM_CALLBACK(self._on_eof)
+        if _pvcam_lib.pl_cam_register_callback_ex3(
+                self._hcam, PL_CALLBACK_EOF,
+                ctypes.cast(self._callback_ref, ctypes.c_void_p), None) != PV_OK:
+            self._circ_buf = None
+            self._callback_ref = None
+            raise RuntimeError(
+                f"pl_cam_register_callback_ex3: {_last_pvcam_error()}")
+
         if _pvcam_lib.pl_exp_start_cont(
                 self._hcam, buf_ptr, uns32(buf_bytes)) != PV_OK:
+            try:
+                _pvcam_lib.pl_cam_deregister_callback(
+                    self._hcam, PL_CALLBACK_EOF)
+            except Exception:
+                pass
+            self._callback_ref = None
             self._circ_buf = None
             raise RuntimeError(
                 f"pl_exp_start_cont: {_last_pvcam_error()}")
@@ -947,7 +947,12 @@ class TeledyneKinetix(BaseCamera):
             _pvcam_lib.pl_exp_stop_cont(self._hcam, int16(CCS_HALT))
         except Exception:
             pass
-        # NOTE: callback stays registered for the camera's lifetime.
+        try:
+            _pvcam_lib.pl_cam_deregister_callback(
+                self._hcam, PL_CALLBACK_EOF)
+        except Exception:
+            pass
+        self._callback_ref = None
         self._circ_buf = None
         self._is_acquiring = False
         logger.info("Acquisition stopped")
