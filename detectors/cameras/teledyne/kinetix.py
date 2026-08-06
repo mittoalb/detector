@@ -912,13 +912,51 @@ class TeledyneKinetix(BaseCamera):
                     buf_ptr.value or 0)
 
         # Register EOF callback right before pl_exp_start_cont — this
-        # ordering is the one that actually delivers callbacks (verified
-        # via /tmp/kinetix_minimal.py). Use a plain nested function (not
-        # a bound method wrapping); bound-method callbacks silently
-        # never fire on some ctypes / PVCAM combos. Keep a Python-side
-        # ref to the CFUNCTYPE object so it isn't GC'd.
+        # ordering is what actually delivers callbacks (verified via
+        # /tmp/kinetix_minimal.py). Inline the entire callback body here
+        # to match the minimal exactly: no self-method indirection.
+        hcam_local = self._hcam
+        frame_queue = self._frame_queue
+        frame_shape_ref = [self._frame_shape]  # mutable box for updates
+        num_bufs = self.NUM_BUFFERS
+        cb_counter = [0]
+
         def _eof_thunk(p_frame_info, p_context):
-            self._on_eof(p_frame_info, p_context)
+            cb_counter[0] += 1
+            n = cb_counter[0]
+            if n <= 3 or n % 200 == 0:
+                # print(), not logger — logger locks can hide callbacks
+                print(f"[kinetix] EOF #{n}", flush=True)
+            ptr = ctypes.c_void_p()
+            if _pvcam_lib.pl_exp_get_latest_frame(
+                    hcam_local, ctypes.byref(ptr)) != PV_OK or not ptr.value:
+                return
+            h, w = frame_shape_ref[0]
+            n_pixels = h * w
+            buf_type = ctypes.c_uint16 * n_pixels
+            try:
+                src = buf_type.from_address(ptr.value)
+                arr = np.frombuffer(src, dtype=np.uint16).reshape((h, w)).copy()
+            except Exception as exc:
+                print(f"[kinetix] frame decode error: {exc}", flush=True)
+                return
+            meta = {}
+            if p_frame_info:
+                fi = ctypes.cast(
+                    p_frame_info, ctypes.POINTER(FRAME_INFO)).contents
+                meta = {"frame_number": int(fi.FrameNr),
+                        "timestamp": int(fi.TimeStamp),
+                        "readout_time": int(fi.ReadoutTime)}
+            if frame_queue.full():
+                try:
+                    frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
+            try:
+                frame_queue.put_nowait((arr, meta))
+            except queue.Full:
+                pass
+
         self._callback_ref = PVCAM_CALLBACK(_eof_thunk)
         if _pvcam_lib.pl_cam_register_callback_ex3(
                 self._hcam, PL_CALLBACK_EOF,
