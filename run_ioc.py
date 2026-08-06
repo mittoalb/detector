@@ -64,6 +64,10 @@ def main():
     logging.basicConfig(
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # Silence caproto's per-connection chatter so real errors are visible
+    for name in ("caproto", "caproto.ctx", "caproto.ch", "caproto.bcast",
+                 "caproto.client", "caproto.circuit"):
+        logging.getLogger(name).setLevel(logging.WARNING)
     logger = logging.getLogger(__name__)
 
     # Load all available backends
@@ -112,14 +116,31 @@ def main():
 
     # Run IOC + optional GUI
     if args.gui:
-        logger.info("Starting IOC server in background thread")
-        ioc_thread = threading.Thread(
-            target=caproto_run, args=(ioc.pvdb,),
-            kwargs={"interfaces": args.interfaces}, daemon=True)
-        ioc_thread.start()
+        # GUI runs as a subprocess and connects to the IOC via CA/PVA.
+        # Qt in the SAME process as the camera driver breaks PVCAM's DMA
+        # signalling (Kinetix); process isolation avoids that entirely,
+        # and is uniform across all camera backends.
+        import os
+        import subprocess
+        logger.info("Launching Qt GUI as subprocess (--prefix %s)",
+                    args.prefix)
+        # Ensure the subprocess can import `detectors.*` regardless of
+        # the shell's cwd — the package lives next to this script.
+        pkg_root = os.path.dirname(os.path.abspath(__file__))
+        env = os.environ.copy()
+        env["PYTHONPATH"] = pkg_root + os.pathsep + env.get("PYTHONPATH", "")
+        gui_proc = subprocess.Popen(
+            [sys.executable, "-m", "detectors.gui.qt_gui",
+             "--prefix", args.prefix,
+             "--log-level", args.log_level],
+            env=env)
 
-        logger.info("Starting Qt GUI")
-        _run_gui(ioc)
+        logger.info("Serving %d PVs on %s", len(ioc.pvdb), args.interfaces)
+        try:
+            caproto_run(ioc.pvdb, interfaces=args.interfaces)
+        finally:
+            gui_proc.terminate()
+            camera.close()
     else:
         logger.info("Serving %d PVs on %s", len(ioc.pvdb), args.interfaces)
         try:
@@ -129,18 +150,23 @@ def main():
 
 
 def _run_gui(ioc):
-    """Launch the Qt GUI bound to the IOC's camera."""
+    """Launch the Qt GUI bound to the IOC's camera.
+
+    Runs in a background thread so the main thread stays available for
+    PVCAM. Qt permits this on Linux/X11 as long as all widgets are
+    created inside this thread (which they are).
+    """
     from detectors.gui.qt_gui import DetectorGui
 
     try:
-        from PyQt5 import QtWidgets
+        from PyQt5 import QtWidgets, QtCore
     except ImportError:
-        from PySide6 import QtWidgets
+        from PySide6 import QtWidgets, QtCore
 
     app = QtWidgets.QApplication(sys.argv)
     window = DetectorGui(ioc)
     window.show()
-    sys.exit(app.exec())
+    app.exec()
 
 
 if __name__ == "__main__":

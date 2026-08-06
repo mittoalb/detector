@@ -859,3 +859,41 @@ class DetectorGui(QtWidgets.QMainWindow):
     def closeEvent(self, event):
         self._refresh_timer.stop()
         super().closeEvent(event)
+
+
+def main():
+    """Standalone CA-client entry point (subprocessed by run_ioc.py --gui).
+
+    Constructs a CA/PVA-backed IocProxy that mimics the in-process IOC
+    interface. This isolates Qt from the camera driver process — which
+    is required for the Kinetix (PVCAM signalling collides with Qt in
+    the same process).
+    """
+    import argparse
+    import sys as _sys
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--prefix", required=True,
+                        help="EPICS PV prefix, e.g. TESTKTX:")
+    parser.add_argument("--log-level", default="INFO")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    for name in ("caproto", "caproto.ctx", "caproto.ch", "caproto.bcast",
+                 "caproto.client", "caproto.circuit"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+    from detectors.gui.ca_proxy import IocProxy
+
+    ioc_proxy = IocProxy(args.prefix)
+
+    app = QtWidgets.QApplication(_sys.argv)
+    window = DetectorGui(ioc_proxy)
+    window.show()
+    _sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
