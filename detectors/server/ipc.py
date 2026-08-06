@@ -69,12 +69,22 @@ class CameraIPCServer:
         self._cam_lock = threading.Lock()
 
     def start(self) -> None:
-        # Best-effort remove of a stale socket from a prior run
-        try:
-            if os.path.exists(self._path):
+        # Handle stale socket files from crashed prior runs. Probe with a
+        # short-timeout connect: if it refuses, no one's listening → unlink
+        # and rebind. If it accepts, another IOC owns this prefix → abort
+        # rather than silently take over.
+        if os.path.exists(self._path):
+            if self._path_is_live():
+                raise RuntimeError(
+                    f"IPC socket {self._path} is in use by another IOC "
+                    f"process (same prefix). Stop the other IOC first.")
+            try:
                 os.unlink(self._path)
-        except OSError:
-            pass
+                logger.info("Removed stale IPC socket %s", self._path)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Cannot remove stale IPC socket {self._path}: {exc}. "
+                    f"Delete it manually and retry.") from exc
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._sock.bind(self._path)
         try:
@@ -86,6 +96,20 @@ class CameraIPCServer:
             target=self._accept_loop, daemon=True, name="CameraIPCServer")
         self._thread.start()
         logger.info("IPC server listening on %s", self._path)
+
+    def _path_is_live(self) -> bool:
+        """True if a process is actively listening on the socket path."""
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.settimeout(0.5)
+        try:
+            probe.connect(self._path)
+            return True
+        except (ConnectionRefusedError, FileNotFoundError, socket.timeout):
+            return False
+        except OSError:
+            return False
+        finally:
+            probe.close()
 
     def stop(self) -> None:
         self._stop.set()

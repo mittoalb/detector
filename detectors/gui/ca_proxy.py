@@ -402,7 +402,7 @@ class CamPluginProxy:
         except Exception as exc:
             logger.warning("pvaccess unavailable — no live frames: %s", exc)
             return
-        pv_name = f"{self._prefix}image1:Pva1:Image"
+        pv_name = f"{self._prefix}image1:ArrayData"
         try:
             channel = pva.Channel(pv_name)
         except Exception as exc:
@@ -528,7 +528,7 @@ class _FilePluginProxy:
 
 class _PvaServerProxy:
     def __init__(self, prefix: str):
-        self._pv_name = f"{prefix}image1:Pva1:Image"
+        self._pv_name = f"{prefix}image1:ArrayData"
 
 
 class IocProxy:
