@@ -52,7 +52,12 @@ CAM_NAME_LEN = 32
 ERROR_MSG_LEN = 255
 
 OPEN_EXCLUSIVE = 0
-CIRC_OVERWRITE = 0
+# PL_CIRC_MODES (pvcam.h): CIRC_NONE=0 (invalid for cont), CIRC_OVERWRITE=1,
+# CIRC_NO_OVERWRITE=2. Getting this wrong makes pl_exp_start_cont fail
+# with PL_ERR_CONFIGURATION_INVALID even though pl_exp_setup_cont succeeds.
+CIRC_NONE = 0
+CIRC_OVERWRITE = 1
+CIRC_NO_OVERWRITE = 2
 CCS_NO_CHANGE = 0
 CCS_HALT = 1
 
