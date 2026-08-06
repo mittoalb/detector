@@ -32,6 +32,10 @@ PARAM_TABS: List[Tuple[str, List[Tuple[str, str]]]] = [
     ("Image Format & ROI", [
         ("Width", "Width (px)"),
         ("Height", "Height (px)"),
+        ("OffsetX", "Offset X (px)"),
+        ("OffsetY", "Offset Y (px)"),
+        ("BinningHorizontal", "Binning Horizontal"),
+        ("BinningVertical", "Binning Vertical"),
         ("Binning", "Binning (digital)"),
         ("SubarrayMode", "Subarray Mode"),
         ("SubarrayHPos", "Subarray H Pos"),
@@ -154,9 +158,12 @@ ENUM_CHOICES: Dict[str, list] = {
     "Binning": [1, 2, 4],
 }
 
-# Parameters that should never be editable in the GUI
+# Parameters that should never be editable in the GUI, regardless of
+# what the backend says. Only truly-derived / inherently-RO values.
+# Width/Height/PixelFormat are settable on Oryx and Kinetix — leave
+# their editability to the backend's is_param_writable report.
 READ_ONLY_PARAMS = {
-    "Width", "Height", "PixelFormat", "BitsPerChannel",
+    "BitsPerChannel",
     "SensorTemperature", "SensorCoolerStatus",
     "SensorTemperatureMin", "SensorTemperatureMax", "SensorTemperatureStatus",
     "AcquisitionFrameRate", "InternalFrameRate", "InternalFrameInterval",
@@ -395,12 +402,38 @@ class DetectorGui(QtWidgets.QMainWindow):
 
         self.statusBar().showMessage("Ready")
 
+    # Prefix-based auto-grouping for backends that expose hundreds of
+    # params (Oryx: 2400+). Order matters — first match wins. Anything
+    # not matched still lands in "Other" as a final catch-all.
+    _AUTO_TAB_RULES = [
+        ("Analog / Gain", ("Gain", "BlackLevel", "Gamma", "Balance", "White",
+                            "Sharpen", "Saturation", "Hue", "AutoExposure")),
+        ("Acquisition Ctrl", ("Acquisition", "Exposure")),
+        ("Trigger", ("Trigger",)),
+        ("Image Format", ("Width", "Height", "Offset", "Binning", "Pixel",
+                           "Reverse", "AdcBitDepth", "DecimationSelector",
+                           "DecimationHorizontal", "DecimationVertical",
+                           "Roi", "Test", "IspEnable")),
+        ("Sensor / Cooling", ("Sensor", "DeviceTemperature", "Cooler",
+                                "Fan")),
+        ("Counter / Timer", ("Counter", "Timer")),
+        ("Logic Block", ("LogicBlock",)),
+        ("User Set", ("UserSet",)),
+        ("Chunk Data", ("Chunk",)),
+        ("Event", ("Event",)),
+        ("Stream", ("Stream",)),
+        ("Transport Layer", ("Tl", "DeviceLink", "GevSCP", "GevSCPS", "Gev",
+                              "USB", "IIDC", "IEEE1394")),
+        ("Device Info", ("Device",)),
+    ]
+
     def _create_tabs(self):
         if not self.camera:
             return
         supported = set(self.camera.list_params())
 
-        # Place every supported param into the matching tab; unmatched go to "Other"
+        # Place every supported param into the matching tab; unmatched
+        # go through the auto-grouper, then finally "Other".
         used: set = set()
         for tab_title, items in PARAM_TABS:
             tab_items = [(k, l) for k, l in items if k in supported]
@@ -411,8 +444,29 @@ class DetectorGui(QtWidgets.QMainWindow):
                 used.add(k)
 
         leftover = sorted(supported - used)
-        if leftover:
-            self._add_tab("Other", [(k, k) for k in leftover])
+        # Auto-group leftover params by name prefix. This turns the
+        # Oryx's 2400+ GenICam nodes from one giant "Other" dump into
+        # digestible categories.
+        grouped: dict = {}
+        remaining: list = []
+        for name in leftover:
+            tab = None
+            for title, prefixes in self._AUTO_TAB_RULES:
+                if any(name.startswith(p) for p in prefixes):
+                    tab = title
+                    break
+            if tab:
+                grouped.setdefault(tab, []).append((name, name))
+            else:
+                remaining.append((name, name))
+        # Emit auto-grouped tabs in the rule order (stable/predictable)
+        for title, _ in self._AUTO_TAB_RULES:
+            items = grouped.get(title)
+            if items:
+                self._add_tab(title, items)
+        # Anything the rules didn't catch
+        if remaining:
+            self._add_tab("Other", remaining)
 
         # Always add a Device Info tab if we have CameraInfo
         info = self.camera.get_info()
@@ -466,6 +520,16 @@ class DetectorGui(QtWidgets.QMainWindow):
         except Exception:
             return None
 
+        # Editability: prefer the camera's own writability report; fall
+        # back to the fixed READ_ONLY_PARAMS set for backends that don't
+        # implement is_param_writable meaningfully.
+        try:
+            writable = bool(self.camera.is_param_writable(key))
+        except Exception:
+            writable = True
+        if key in READ_ONLY_PARAMS:
+            writable = False
+
         if key in ENUM_CHOICES:
             combo = QtWidgets.QComboBox()
             for choice in ENUM_CHOICES[key]:
@@ -475,7 +539,7 @@ class DetectorGui(QtWidgets.QMainWindow):
                 idx = combo.findText(str(value))
             if idx >= 0:
                 combo.setCurrentIndex(idx)
-            if key in READ_ONLY_PARAMS:
+            if not writable:
                 combo.setEnabled(False)
             else:
                 combo.currentIndexChanged.connect(
@@ -483,7 +547,7 @@ class DetectorGui(QtWidgets.QMainWindow):
             return combo
 
         edit = QtWidgets.QLineEdit(str(value))
-        if key in READ_ONLY_PARAMS:
+        if not writable:
             edit.setReadOnly(True)
         else:
             edit.returnPressed.connect(lambda k=key: self._apply_single(k))
@@ -878,9 +942,8 @@ def main():
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    from detectors.core.log_util import install_color_logging
+    install_color_logging(level=getattr(logging, args.log_level))
     for name in ("caproto", "caproto.ctx", "caproto.ch", "caproto.bcast",
                  "caproto.client", "caproto.circuit"):
         logging.getLogger(name).setLevel(logging.WARNING)

@@ -10,6 +10,7 @@ from caproto.server import PVGroup, SubGroup
 from detectors.core.base import BaseCamera
 from detectors.server.cam_plugin import CamPlugin
 from detectors.server.hdf5_plugin import HDF5Plugin
+from detectors.server.ipc import CameraIPCServer, socket_path_for
 from detectors.server.ntnda_server import NTNDArrayServer
 from detectors.server.tiff_plugin import TIFFPlugin
 
@@ -66,3 +67,16 @@ class DetectorIOC(PVGroup):
             self.cam1.register_frame_callback(self._pva_server.publish_frame)
         except Exception as exc:
             logger.warning("PVA server unavailable: %s", exc)
+
+        # Local IPC socket so the GUI subprocess can reach the camera's
+        # full BaseCamera surface (all Oryx GenICam features, all DCAM
+        # properties, all PVCAM params) rather than just the 15-key CA
+        # gateway in cam_plugin. Camera-agnostic — every backend gets it.
+        self._ipc_server = None
+        if camera is not None:
+            try:
+                self._ipc_server = CameraIPCServer(
+                    camera, socket_path_for(prefix))
+                self._ipc_server.start()
+            except Exception as exc:
+                logger.warning("IPC server unavailable: %s", exc)
