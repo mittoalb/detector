@@ -225,6 +225,10 @@ class DetectorGui(QtWidgets.QMainWindow):
         self._fps_last_t = 0.0
         self._measured_fps = 0.0
 
+        # Trigger state snapshot taken at Free Run so Acquire can
+        # restore whatever the user had configured before.
+        self._saved_trigger = None
+
         self._build_ui()
         self._populate_values()
 
@@ -822,18 +826,65 @@ class DetectorGui(QtWidgets.QMainWindow):
         self.ioc.cam1.TriggerSource._data["value"] = "Internal"
 
     def _start_free_run(self):
-        """Force TriggerMode=Off / TriggerSource=Internal, then acquire."""
+        """Force TriggerMode=Off / TriggerSource=Internal, then acquire.
+
+        Before overriding, snapshot the current trigger so Acquire can
+        restore it on the next click — supports the common workflow:
+            External trigger set → Free Run (quick check) → Acquire
+            (should go back to External without the user re-selecting it).
+        """
+        self._snapshot_trigger()
         self._start_acquisition(force_internal=True)
 
     def _start_acquire(self):
-        """Acquire with the current trigger settings unchanged.
+        """Acquire, restoring the trigger state saved by the last Free Run.
 
-        Use this when an external signal or software trigger is driving
-        the camera — the previous single Start button silently overrode
-        that, which left users waiting on a trigger that would never
-        arrive after clicking Start.
+        If the camera is still in the Off/Internal state that Free Run
+        left it in, we put it back to whatever was in effect before.
+        If the user has manually changed the trigger since, we respect
+        their change (don't overwrite).
         """
+        self._maybe_restore_trigger()
         self._start_acquisition(force_internal=False)
+
+    def _snapshot_trigger(self):
+        """Save TriggerMode + TriggerSource for _maybe_restore_trigger."""
+        if not self.camera:
+            return
+        try:
+            self._saved_trigger = {
+                "TriggerMode": str(self.camera.get_param("TriggerMode")),
+                "TriggerSource": str(self.camera.get_param("TriggerSource")),
+            }
+        except Exception:
+            self._saved_trigger = None
+
+    def _maybe_restore_trigger(self):
+        """Restore the pre-Free-Run trigger state, if we can safely do so.
+
+        Guarded so a manual trigger change after Free Run doesn't get
+        overwritten: only restore if the camera is still in the state
+        Free Run put it in (TriggerMode=Off or TriggerSource=Internal).
+        Clears the snapshot after use.
+        """
+        snap = getattr(self, "_saved_trigger", None)
+        if not snap or not self.camera:
+            return
+        try:
+            cur_mode = str(self.camera.get_param("TriggerMode"))
+            cur_src = str(self.camera.get_param("TriggerSource"))
+        except Exception:
+            return
+        if cur_mode == "Off" or cur_src == "Internal":
+            for key in ("TriggerSource", "TriggerMode"):
+                try:
+                    self.camera.set_param(key, snap[key])
+                except Exception:
+                    pass
+            self._log(
+                f"Trigger restored: mode={snap['TriggerMode']} "
+                f"source={snap['TriggerSource']}")
+        self._saved_trigger = None
 
     def _start_acquisition(self, force_internal: bool = False):
         try:
