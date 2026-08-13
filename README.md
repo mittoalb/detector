@@ -110,6 +110,49 @@ python run_ioc.py --camera simulator --list-pvs
 python run_ioc.py --camera simulator --pva-pv MYDET:image:NTNDArray
 ```
 
+### Reopening the GUI without restarting the IOC
+
+If you close the Qt window but the IOC is still running (`ps aux | grep
+run_ioc` will show it), reattach a fresh GUI without touching the camera:
+
+```bash
+python run_ioc.py --gui-only --prefix ORYX:
+```
+
+This spawns just the GUI subprocess. Camera state, acquisition, and any
+in-flight HDF5 capture are preserved.
+
+### Stopping a running IOC
+
+`Ctrl-C` in the terminal is the intended shutdown — it cleans up the IPC
+socket, releases the camera SDK, and terminates the GUI subprocess.
+
+If the terminal is gone or the process is stuck, find and kill it:
+
+```bash
+# Find your IOC(s)
+ps -u $USER -o pid,stat,cmd | grep run_ioc | grep -v grep
+
+# Graceful termination (recommended — lets the camera close properly)
+pkill -TERM -u $USER -f "run_ioc.py.*--prefix ORYX:"
+
+# Only if TERM doesn't work after ~5 seconds
+pkill -KILL -u $USER -f "run_ioc.py.*--prefix ORYX:"
+```
+
+`pkill -TERM` gives the process a chance to release the camera SDK cleanly.
+`-KILL` is a last resort — the vendor SDK may leave the camera in a weird
+state and you'll need to power-cycle it.
+
+### Common startup errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `IPC socket … in use by another IOC` | Another IOC with the same prefix is already running under your user | `ps -u $USER \| grep run_ioc` — either use it or kill it first |
+| `Cannot remove stale IPC socket … Operation not permitted` | Socket file was left by a different user (shouldn't happen with per-UID paths, but stale from an older build might) | `sudo rm /tmp/detector_ioc_*.sock`, then retry |
+| `spinError=-1005` (Oryx, access denied) | Camera is already opened by another process (ADSpinnaker EPICS IOC, another Python session) | Stop the other process first |
+| GUI shows sensor size but no live frames | `<prefix>image1:ArrayData` PVA channel unreachable (firewall / different subnet) | Check `<prefix>image1:ArrayData` is reachable with `pvget` |
+
 ### Logging colors
 
 The console uses ANSI-256 colors on level (INFO cyan, WARNING amber, ERROR

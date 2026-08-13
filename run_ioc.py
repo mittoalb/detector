@@ -65,7 +65,32 @@ def main():
                         help="List served PVs and exit")
     parser.add_argument("--gui", action="store_true",
                         help="Launch the Qt GUI alongside the IOC")
+    parser.add_argument("--gui-only", action="store_true",
+                        help="Launch ONLY the Qt GUI against an already-"
+                             "running IOC at --prefix (no camera/IOC "
+                             "startup). Use this to reopen the GUI after "
+                             "closing its window.")
     args = parser.parse_args()
+
+    # --gui-only: just spawn the GUI subprocess and wait, no IOC.
+    # Handy for reattaching after closing the window without kicking the
+    # running IOC (which still serves PVs, PVA frames, and IPC).
+    if args.gui_only:
+        _install_color_logging(level=getattr(logging, args.log_level))
+        import os
+        import subprocess
+        logger = logging.getLogger(__name__)
+        pkg_root = os.path.dirname(os.path.abspath(__file__))
+        env = os.environ.copy()
+        env["PYTHONPATH"] = pkg_root + os.pathsep + env.get("PYTHONPATH", "")
+        logger.info("Attaching GUI to running IOC at prefix %s", args.prefix)
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "detectors.gui.qt_gui",
+             "--prefix", args.prefix,
+             "--log-level", args.log_level],
+            env=env)
+        proc.wait()
+        return
 
     _install_color_logging(level=getattr(logging, args.log_level))
     # Silence caproto's per-connection chatter so real errors are visible
