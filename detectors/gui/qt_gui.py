@@ -269,6 +269,19 @@ class DetectorGui(QtWidgets.QMainWindow):
         self.single_btn.clicked.connect(self._single_frame)
         self.trigger_btn.clicked.connect(self._software_trigger)
 
+        # "Free-run on Start" — checked by default so casual Start/Capture
+        # gives you frames without configuring anything. Uncheck to keep
+        # the current trigger (External/Software) — needed when a scan
+        # controller or downstream is driving the shutter.
+        self.freerun_check = QtWidgets.QCheckBox("Free-run on Start")
+        self.freerun_check.setChecked(True)
+        self.freerun_check.setToolTip(
+            "Checked: Start/Capture forces TriggerMode=Off (free-run).\n"
+            "Unchecked: keep whatever trigger is currently configured —\n"
+            "use this when an external signal or software trigger is driving\n"
+            "acquisition.")
+        toolbar.addWidget(self.freerun_check)
+
         # Body: tabs on left, status panel on right
         body = QtWidgets.QHBoxLayout()
         layout.addLayout(body, 1)
@@ -305,6 +318,16 @@ class DetectorGui(QtWidgets.QMainWindow):
         cam_row.addWidget(self.cam_label)
         cam_row.addStretch()
         status_form.addRow("Camera:", cam_row)
+
+        # Trigger badge — big, colored, updated by _refresh_readonly.
+        # Green FREE-RUN, amber EXT TRIGGER, blue SOFTWARE — the user
+        # never has to guess whether they're waiting on a trigger line.
+        self.trigger_badge = QtWidgets.QLabel("—")
+        self.trigger_badge.setAlignment(QtCore.Qt.AlignCenter)
+        self.trigger_badge.setStyleSheet(
+            "QLabel { background-color: #3c4043; color: #f1f3f4; "
+            "font-weight: bold; padding: 6px 10px; border-radius: 4px; }")
+        status_form.addRow("Trigger:", self.trigger_badge)
 
         # Live status fields
         for name, label in [
@@ -589,6 +612,11 @@ class DetectorGui(QtWidgets.QMainWindow):
                 except Exception:
                     pass
 
+        # Trigger badge — colored to make the current mode unmistakable.
+        # Users have gotten stuck waiting on an External trigger when they
+        # meant to free-run; the color + label prevents that.
+        self._refresh_trigger_badge()
+
         # File save status — pulled from whichever writer is currently
         # selected in the Format combo. Both plugins expose the same
         # attribute/PV names, so this code is format-agnostic.
@@ -739,6 +767,36 @@ class DetectorGui(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+    def _refresh_trigger_badge(self):
+        """Colored badge showing the effective trigger state.
+
+        - FREE-RUN (green): TriggerMode=Off or TriggerSource=Internal
+        - EXT TRIGGER (amber, bold): External / Line0-N
+        - SW TRIGGER (blue): Software
+        """
+        try:
+            tmode = str(self.camera.get_param("TriggerMode"))
+        except Exception:
+            tmode = ""
+        try:
+            tsrc = str(self.camera.get_param("TriggerSource"))
+        except Exception:
+            tsrc = ""
+
+        if tmode in ("Off", "0", "False") or tsrc == "Internal":
+            label, bg, fg = "FREE-RUN", "#188038", "#e6f4ea"
+        elif tsrc == "Software":
+            label, bg, fg = "SW TRIGGER", "#1a73e8", "#e8f0fe"
+        elif tsrc in ("External", "Line0", "Line1", "Line2", "Line3"):
+            label, bg, fg = f"EXT TRIGGER  ({tsrc})", "#e37400", "#202124"
+        else:
+            label, bg, fg = f"{tmode or 'On'} / {tsrc or '?'}", "#e37400", "#202124"
+
+        self.trigger_badge.setText(label)
+        self.trigger_badge.setStyleSheet(
+            f"QLabel {{ background-color: {bg}; color: {fg}; "
+            f"font-weight: bold; padding: 6px 10px; border-radius: 4px; }}")
+
     def _force_internal_trigger(self):
         """Switch the camera to Internal trigger / TriggerMode=Off.
 
@@ -764,14 +822,17 @@ class DetectorGui(QtWidgets.QMainWindow):
             self._fps_count = 0
             self._fps_last_t = 0.0
             self._measured_fps = 0.0
-            self._force_internal_trigger()
-            # Free-running until user clicks Stop
+            forced = False
+            if self.freerun_check.isChecked():
+                self._force_internal_trigger()
+                forced = True
             self.ioc.cam1.ImageMode._data["value"] = "Continuous"
             self.ioc.cam1.NumImages._data["value"] = 0
             self.ioc.cam1._start_acquisition()
-            # Refresh widget values
             self._populate_values()
-            self._log("Acquisition started (continuous, free-run)")
+            mode = "continuous, free-run" if forced else \
+                   "continuous, external/current trigger"
+            self._log(f"Acquisition started ({mode})")
         except Exception as exc:
             self._log(f"Start failed: {exc}")
 
@@ -874,10 +935,12 @@ class DetectorGui(QtWidgets.QMainWindow):
 
             # Optionally start acquisition if not already running
             if not self.ioc.cam1._acquiring:
-                # Force Internal trigger — the hardware default is External
-                # (for tomoscan); GUI-driven captures need to free-run.
-                self._force_internal_trigger()
-                # Set image mode to Multiple with NumImages = num
+                # Free-run only if the checkbox says so — otherwise keep
+                # whatever trigger is currently configured (External /
+                # Software / etc.), so users driving the camera from an
+                # external signal aren't silently overridden.
+                if self.freerun_check.isChecked():
+                    self._force_internal_trigger()
                 self.ioc.cam1.ImageMode._data["value"] = "Multiple"
                 self.ioc.cam1.NumImages._data["value"] = num
                 self.ioc.cam1._start_acquisition()
