@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "orca-detector"
-version = "0.1.0"
-description = "ORCA Fire camera control: Qt GUI + areaDetector-compatible EPICS IOC via harvesters/GenTL"
+name = "detectors"
+version = "0.2.0"
+description = "Camera-agnostic areaDetector EPICS IOC + Qt GUI for scientific cameras (Hamamatsu, Teledyne FLIR Oryx, Photometrics Kinetix)"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.8"
@@ -39,10 +39,6 @@ save = [
     "tifffile>=2023.1.0",
 ]
 
-[project.scripts]
-orca-qt = "orca.qt_detector:main"
-orca-ioc = "run_orca_ioc:main"
-
 [project.urls]
 Homepage = "https://github.com/mittoalb/detector"
 Repository = "https://github.com/mittoalb/detector"
@@ -50,7 +46,7 @@ Issues = "https://github.com/mittoalb/detector/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["orca*"]
+include = ["detectors*"]
 
 [tool.black]
 line-length = 88
