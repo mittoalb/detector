@@ -530,8 +530,29 @@ class CamPlugin(PVGroup):
                 try:
                     frame = self._camera.acquire_frame(timeout_ms=5000)
                 except Exception as exc:
-                    logger.warning("Frame acquisition failed: %s", exc)
+                    # Waiting-for-trigger timeouts are the expected state
+                    # when a trigger line is armed but no signal arrives.
+                    # Log them once per burst at INFO, and quietly retry —
+                    # otherwise the console fills with a WARNING every 5s
+                    # that looks like something's broken.
+                    msg = str(exc)
+                    is_timeout = (
+                        "0x80000106" in msg          # DCAMERR_TIMEOUT
+                        or "timed out" in msg.lower()
+                        or "TIMEOUT" in msg.upper()
+                        or "not running" in msg      # stop/loop race
+                    )
+                    if is_timeout:
+                        if not getattr(self, "_wait_trigger_logged", False):
+                            logger.info(
+                                "Waiting for trigger — no frame yet "
+                                "(will keep retrying silently): %s", exc)
+                            self._wait_trigger_logged = True
+                    else:
+                        logger.warning("Frame acquisition failed: %s", exc)
                     continue
+                # Fresh frame → reset the once-per-burst log latch
+                self._wait_trigger_logged = False
 
                 if frame is None:
                     continue
