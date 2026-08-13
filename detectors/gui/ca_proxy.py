@@ -121,7 +121,7 @@ class _CADataDict:
         if key != "value":
             raise KeyError(key)
         try:
-            resp = self._ca.get(self._pvname, timeout=0.5)
+            resp = self._ca.get(self._pvname, timeout=3.0)
             v = _decode_ca_value(resp)
             if v is None:
                 return self._default
@@ -158,7 +158,7 @@ class _CAHelper:
             (self._pv_cache[name],) = self._ctx.get_pvs(name)
         return self._pv_cache[name]
 
-    def get(self, name, timeout=0.5):
+    def get(self, name, timeout=3.0):
         return self._pv(name).read(timeout=timeout)
 
     def put(self, name, value, wait=False):
@@ -331,7 +331,7 @@ class CameraProxy:
 
     def _safe_get(self, pv_short, default=None, cast=None):
         try:
-            resp = self._ca.get(f"{self._prefix}{pv_short}", timeout=0.5)
+            resp = self._ca.get(f"{self._prefix}{pv_short}", timeout=3.0)
             v = _decode_ca_value(resp)
             if cast is not None:
                 try:
@@ -367,7 +367,7 @@ class CamPluginProxy:
     @property
     def _acquiring(self) -> bool:
         try:
-            resp = self._ca.get(f"{self._prefix}cam1:Acquire", timeout=0.5)
+            resp = self._ca.get(f"{self._prefix}cam1:Acquire", timeout=3.0)
             v = resp.data[0] if hasattr(resp, "data") else resp
             if isinstance(v, bytes):
                 v = v.decode("utf-8", errors="replace")
@@ -502,7 +502,7 @@ class _FilePluginProxy:
 
     def _read_int(self, suffix: str) -> int:
         try:
-            resp = self._ca.get(f"{self._pv_base}:{suffix}", timeout=0.5)
+            resp = self._ca.get(f"{self._pv_base}:{suffix}", timeout=3.0)
             v = _decode_ca_value(resp)
             return int(v) if v is not None else 0
         except Exception:
