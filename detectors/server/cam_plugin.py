@@ -489,8 +489,13 @@ class CamPlugin(PVGroup):
         try:
             if self._camera:
                 try:
-                    self._camera.set_param("ExposureTime",
-                                           float(self.AcquireTime.value))
+                    # Don't overwrite ExposureTime here — the camera
+                    # already has whatever the user (or tomoscan) most
+                    # recently wrote via cam1:AcquireTime.putter or via
+                    # the GUI's IPC set_param. Rewriting from the PV
+                    # value clobbers GUI edits that went directly to
+                    # the camera, which surprised users as "exposure
+                    # changes when I click Free Run / Acquire".
                     self._camera.start_acquisition()
                 except Exception as exc:
                     # DO NOT null out self._camera here. A transient
