@@ -49,9 +49,19 @@ logger = logging.getLogger(__name__)
 
 
 def socket_path_for(prefix: str) -> str:
-    """Derive the socket path from an EPICS prefix (colons stripped)."""
+    """Derive the socket path from an EPICS prefix + current UID.
+
+    Including the UID prevents cross-user collisions in /tmp: user A can't
+    unlink() a socket file owned by user B (EPERM), so a shared path would
+    permanently strand the second user's IPC until root cleaned it up.
+    Each user's driver process gets its own file under its own ownership.
+    """
     clean = prefix.replace(":", "").replace("/", "_") or "default"
-    return f"/tmp/detector_ioc_{clean}.sock"
+    try:
+        uid = os.getuid()
+    except AttributeError:  # non-POSIX fallback
+        uid = 0
+    return f"/tmp/detector_ioc_{clean}_uid{uid}.sock"
 
 
 class CameraIPCServer:
