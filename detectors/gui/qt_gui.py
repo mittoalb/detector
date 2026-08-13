@@ -254,33 +254,37 @@ class DetectorGui(QtWidgets.QMainWindow):
         toolbar.addWidget(title)
         toolbar.addStretch(1)
 
-        self.start_btn = QtWidgets.QPushButton("Start")
+        # Two start buttons with different trigger semantics:
+        #   Free Run — forces TriggerMode=Off, TriggerSource=Internal
+        #   Acquire  — starts with whatever trigger is currently configured
+        # This avoids the previous silent override that left users stuck
+        # when they wanted an external signal to drive the camera.
+        self.freerun_btn = QtWidgets.QPushButton("Free Run")
+        self.freerun_btn.setToolTip(
+            "Start acquisition in free-run mode: forces TriggerMode=Off, "
+            "TriggerSource=Internal.")
+        self.acquire_btn = QtWidgets.QPushButton("Acquire")
+        self.acquire_btn.setToolTip(
+            "Start acquisition with the current trigger settings unchanged. "
+            "Use this when an external signal or software trigger is driving "
+            "the camera.")
         self.stop_btn = QtWidgets.QPushButton("Stop")
         self.apply_btn = QtWidgets.QPushButton("Apply Changes")
         self.single_btn = QtWidgets.QPushButton("Single Frame")
         self.trigger_btn = QtWidgets.QPushButton("Software Trigger")
-        for btn in [self.start_btn, self.stop_btn, self.apply_btn,
-                    self.single_btn, self.trigger_btn]:
+        for btn in [self.freerun_btn, self.acquire_btn, self.stop_btn,
+                    self.apply_btn, self.single_btn, self.trigger_btn]:
             btn.setMinimumWidth(120)
             toolbar.addWidget(btn)
-        self.start_btn.clicked.connect(self._start_acquisition)
+        self.freerun_btn.clicked.connect(self._start_free_run)
+        self.acquire_btn.clicked.connect(self._start_acquire)
         self.stop_btn.clicked.connect(self._stop_acquisition)
         self.apply_btn.clicked.connect(self._apply_all)
         self.single_btn.clicked.connect(self._single_frame)
         self.trigger_btn.clicked.connect(self._software_trigger)
-
-        # "Free-run on Start" — checked by default so casual Start/Capture
-        # gives you frames without configuring anything. Uncheck to keep
-        # the current trigger (External/Software) — needed when a scan
-        # controller or downstream is driving the shutter.
-        self.freerun_check = QtWidgets.QCheckBox("Free-run on Start")
-        self.freerun_check.setChecked(True)
-        self.freerun_check.setToolTip(
-            "Checked: Start/Capture forces TriggerMode=Off (free-run).\n"
-            "Unchecked: keep whatever trigger is currently configured —\n"
-            "use this when an external signal or software trigger is driving\n"
-            "acquisition.")
-        toolbar.addWidget(self.freerun_check)
+        # Back-compat alias in case anything else in this class references
+        # the old self.start_btn name.
+        self.start_btn = self.freerun_btn
 
         # Body: tabs on left, status panel on right
         body = QtWidgets.QHBoxLayout()
@@ -817,21 +821,33 @@ class DetectorGui(QtWidgets.QMainWindow):
         self.ioc.cam1.TriggerMode_RBV._data["value"] = "Off"
         self.ioc.cam1.TriggerSource._data["value"] = "Internal"
 
-    def _start_acquisition(self):
+    def _start_free_run(self):
+        """Force TriggerMode=Off / TriggerSource=Internal, then acquire."""
+        self._start_acquisition(force_internal=True)
+
+    def _start_acquire(self):
+        """Acquire with the current trigger settings unchanged.
+
+        Use this when an external signal or software trigger is driving
+        the camera — the previous single Start button silently overrode
+        that, which left users waiting on a trigger that would never
+        arrive after clicking Start.
+        """
+        self._start_acquisition(force_internal=False)
+
+    def _start_acquisition(self, force_internal: bool = False):
         try:
             self._fps_count = 0
             self._fps_last_t = 0.0
             self._measured_fps = 0.0
-            forced = False
-            if self.freerun_check.isChecked():
+            if force_internal:
                 self._force_internal_trigger()
-                forced = True
             self.ioc.cam1.ImageMode._data["value"] = "Continuous"
             self.ioc.cam1.NumImages._data["value"] = 0
             self.ioc.cam1._start_acquisition()
             self._populate_values()
-            mode = "continuous, free-run" if forced else \
-                   "continuous, external/current trigger"
+            mode = "free-run" if force_internal else \
+                   "current trigger settings"
             self._log(f"Acquisition started ({mode})")
         except Exception as exc:
             self._log(f"Start failed: {exc}")
@@ -933,14 +949,10 @@ class DetectorGui(QtWidgets.QMainWindow):
             fmt = self.save_format_combo.currentText()
             self._log(f"Capturing {num} frames to {full} ({fmt})")
 
-            # Optionally start acquisition if not already running
+            # Start acquisition if not already running. Do NOT touch the
+            # trigger — Capture respects whatever the user has configured
+            # (Free Run button clears it, Acquire button keeps it).
             if not self.ioc.cam1._acquiring:
-                # Free-run only if the checkbox says so — otherwise keep
-                # whatever trigger is currently configured (External /
-                # Software / etc.), so users driving the camera from an
-                # external signal aren't silently overridden.
-                if self.freerun_check.isChecked():
-                    self._force_internal_trigger()
                 self.ioc.cam1.ImageMode._data["value"] = "Multiple"
                 self.ioc.cam1.NumImages._data["value"] = num
                 self.ioc.cam1._start_acquisition()
