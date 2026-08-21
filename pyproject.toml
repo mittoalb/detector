@@ -44,6 +44,9 @@ Homepage = "https://github.com/mittoalb/detector"
 Repository = "https://github.com/mittoalb/detector"
 Issues = "https://github.com/mittoalb/detector/issues"
 
+[project.scripts]
+detectors-cli = "detectors.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["detectors*"]
