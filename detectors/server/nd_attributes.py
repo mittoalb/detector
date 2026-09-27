@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
-from caproto.threading.client import Context, SharedBroadcaster
+import epics  # pyepics — proven-reliable CA client, also used by tomoscan
 
 logger = logging.getLogger(__name__)
 
@@ -148,11 +148,17 @@ def parse_attributes_xml(
 
 
 class NDAttributesManager:
-    """Owns caproto subscriptions for a set of NDAttributes, keeps a live
+    """Owns pyepics subscriptions for a set of NDAttributes, keeps a live
     cache of their latest values, and exposes a non-blocking snapshot().
 
-    Thread-safe. Subscription callbacks run on caproto's threads; snapshot()
-    can be called from any thread (typically the camera acquisition loop).
+    Thread-safe. Value updates arrive on pyepics's CA callback thread;
+    snapshot() can be called from any thread (typically the camera
+    acquisition loop).
+
+    Why pyepics and not caproto's threading client? caproto's client
+    inside a caproto server process failed to connect to remote PVs in
+    the 32-ID environment (0/174 connected). pyepics is what tomoscan
+    uses successfully from the same shell, so we know it works.
     """
 
     def __init__(
@@ -165,11 +171,8 @@ class NDAttributesManager:
         # Value cache: attr_name -> (value, timestamp, ever_connected)
         self._values: Dict[str, Tuple[object, float, bool]] = {}
         self._lock = threading.Lock()
-        # caproto plumbing
-        self._broadcaster: Optional[SharedBroadcaster] = None
-        self._context: Optional[Context] = None
-        self._pvs: Dict[str, object] = {}          # attr_name -> caproto PV
-        self._subs: Dict[str, object] = {}         # attr_name -> Subscription
+        # pyepics PV objects, one per attribute
+        self._pvs: Dict[str, epics.PV] = {}
         self._specs: List[AttributeSpec] = []
         # Frame counter — synApps treats NDArrayUniqueId as an implicit
         # driver-provided attribute; caller feeds it via update_uid().
@@ -206,24 +209,11 @@ class NDAttributesManager:
         with self._lock:
             self._values = {s.name: (None, 0.0, False) for s in specs}
 
-        self._start_context()
         self._create_subscriptions()
 
     def close(self) -> None:
-        """Disconnect everything. Idempotent."""
+        """Disconnect all PVs. Idempotent."""
         self._teardown_subscriptions()
-        if self._context is not None:
-            try:
-                self._context.disconnect()
-            except Exception:
-                logger.exception("Error disconnecting caproto context")
-            self._context = None
-        if self._broadcaster is not None:
-            try:
-                self._broadcaster.disconnect()
-            except Exception:
-                logger.exception("Error disconnecting caproto broadcaster")
-            self._broadcaster = None
 
     # ---------------- data access -------------------------------------
 
@@ -310,117 +300,127 @@ class NDAttributesManager:
             f"NDAttributes XML {xml_file!r} not found. Tried:\n  "
             + "\n  ".join(tried))
 
-    def _start_context(self) -> None:
-        if self._broadcaster is None:
-            self._broadcaster = SharedBroadcaster()
-        if self._context is None:
-            self._context = Context(broadcaster=self._broadcaster)
-
     def _create_subscriptions(self) -> None:
         if not self._specs:
             return
-        pvnames = [s.pvname for s in self._specs]
-        # get_pvs returns one PV per name, in order, and starts async
-        # search immediately. This does NOT block on connection.
-        pv_objs = self._context.get_pvs(*pvnames)
 
-        for spec, pv in zip(self._specs, pv_objs):
-            self._pvs[spec.name] = pv
+        # Create pyepics PVs — non-blocking. Each PV starts its own async
+        # search. add_callback() gets fired both on the initial value AND
+        # on every monitor update.
+        for spec in self._specs:
             try:
-                sub = pv.subscribe(data_type="time")
-                sub.add_callback(self._make_callback(spec.name))
-                self._subs[spec.name] = sub
+                pv = epics.PV(
+                    spec.pvname,
+                    callback=self._make_callback(spec.name),
+                    auto_monitor=True,
+                    connection_callback=self._make_conn_callback(spec.name),
+                )
+                self._pvs[spec.name] = pv
             except Exception:
                 logger.exception(
-                    "Failed to subscribe to %s (attr %s)",
+                    "Failed to create PV %s (attr %s)",
                     spec.pvname, spec.name)
 
         logger.info(
             "NDAttributesManager: %d subscriptions queued for %s",
-            len(self._subs), self._loaded_path)
+            len(self._pvs), self._loaded_path)
 
-        # Kick a background thread that waits for connections and
-        # updates the cache's "ever_connected" bit from pv.connected —
-        # so status() reports live truth, not "0 because the callback
-        # hasn't fired yet". Also lets us log per-PV failures.
+        # Background thread: wait for connections and log per-PV status
+        # so operators can immediately see which IOCs are down.
         t = threading.Thread(
             target=self._connect_and_report,
             daemon=True, name="ndattrs-connect")
         t.start()
 
     def _connect_and_report(
-        self, wait_seconds: float = 15.0, poll: float = 0.5,
+        self, wait_seconds: float = 10.0,
     ) -> None:
-        """Poll pv.connected up to wait_seconds. Mark ever_connected true
-        for every PV that reports connected; log any that never do."""
+        """Wait up to wait_seconds for PVs to connect, then log stats."""
         deadline = time.monotonic() + wait_seconds
-        remaining = dict(self._pvs)   # attr_name -> pv
-        connected_names: List[str] = []
-        while remaining and time.monotonic() < deadline:
-            for name in list(remaining):
-                pv = remaining[name]
-                if pv.connected:
-                    with self._lock:
-                        val, ts, _ever = self._values.get(
-                            name, (None, 0.0, False))
-                        self._values[name] = (val, ts, True)
-                    connected_names.append(name)
-                    del remaining[name]
-            if remaining:
-                time.sleep(poll)
+        while time.monotonic() < deadline:
+            with self._lock:
+                unconnected = [
+                    name for name, (_, _, ever) in self._values.items()
+                    if not ever
+                ]
+            if not unconnected:
+                break
+            time.sleep(0.5)
 
-        n_conn = len(connected_names)
-        n_total = len(self._pvs)
+        with self._lock:
+            n_conn = sum(1 for _, (_, _, ever) in self._values.items() if ever)
+            n_total = len(self._values)
+            missing = [
+                name for name, (_, _, ever) in self._values.items() if not ever
+            ]
         logger.info(
             "NDAttributesManager: %d/%d PVs connected within %.0fs",
             n_conn, n_total, wait_seconds)
-        if remaining:
-            # Log up to 20 names so operators can spot which IOC is down
-            sample = list(remaining.items())[:20]
+        if missing:
+            sample = missing[:20]
+            pv_by_name = {s.name: s.pvname for s in self._specs}
             logger.warning(
                 "NDAttributesManager: %d PVs never connected. Examples:\n  %s",
-                len(remaining),
-                "\n  ".join(f"{n} -> {pv.name}" for n, pv in sample))
+                len(missing),
+                "\n  ".join(f"{n} -> {pv_by_name.get(n, '?')}"
+                            for n in sample))
 
     def _make_callback(self, attr_name: str) -> Callable:
-        # Bound closure so caproto's callback interface (sub, response)
-        # gets routed to this manager's cache under a name key.
-        def _cb(sub, response):
+        """pyepics value callback. Fires on initial value + every update.
+
+        Normalizes so downstream layout writer never has to guess:
+          - CHAR waveforms (numpy uint8 arrays) → utf-8 str, null-stripped
+          - DBR_STRING (bytes) → utf-8 str, null-stripped
+          - Existing str → null-stripped
+          - Everything else (int/float/array) → passed through as-is
+        """
+        # dbrtype hint helps decide whether a numpy uint8 array is meant
+        # as a string or as raw bytes.
+        dbrtype = self.dbrtype_for(attr_name)
+
+        def _cb(pvname=None, value=None, **kw):
             try:
-                data = response.data
-                # caproto returns a tuple/array for the data field; scalar
-                # PVs have length 1. Take the singleton, else keep as-is.
-                if hasattr(data, "__len__") and len(data) == 1:
-                    value = data[0]
-                    if isinstance(value, bytes):
-                        try:
-                            value = value.decode("utf-8", errors="replace")
-                        except Exception:
-                            pass
+                v = value
+                if isinstance(v, bytes):
+                    v = v.decode("utf-8", errors="replace").rstrip("\x00")
+                elif isinstance(v, str):
+                    v = v.rstrip("\x00")
                 else:
-                    value = data
+                    # numpy uint8 array from CHAR waveform (== a string) —
+                    # only decode if this attr was declared DBR_STRING or
+                    # its dtype clearly signals ASCII (uint8).
+                    try:
+                        import numpy as _np
+                        if isinstance(v, _np.ndarray) and v.dtype == _np.uint8:
+                            if dbrtype == "DBR_STRING" or True:
+                                # Almost always a CHAR-waveform string in
+                                # areaDetector; strip nulls, decode ASCII.
+                                v = bytes(v).decode(
+                                    "ascii", errors="replace").rstrip("\x00")
+                    except Exception:
+                        pass
                 with self._lock:
-                    self._values[attr_name] = (value, time.time(), True)
+                    self._values[attr_name] = (v, time.time(), True)
             except Exception:
                 logger.exception(
                     "Error handling monitor update for attr %s", attr_name)
         return _cb
 
+    def _make_conn_callback(self, attr_name: str) -> Callable:
+        """pyepics connection callback. Sets ever_connected=True as soon
+        as the PV connects, even before the first value arrives."""
+        def _cb(pvname=None, conn=False, **kw):
+            if conn:
+                with self._lock:
+                    val, ts, _ = self._values.get(
+                        attr_name, (None, 0.0, False))
+                    self._values[attr_name] = (val, ts, True)
+        return _cb
+
     def _teardown_subscriptions(self) -> None:
-        for name, sub in list(self._subs.items()):
-            try:
-                sub.clear()
-            except Exception:
-                logger.debug("clear() failed for %s", name, exc_info=True)
-        self._subs.clear()
         for name, pv in list(self._pvs.items()):
             try:
-                pv.unsubscribe_all()
+                pv.disconnect()
             except Exception:
-                logger.debug("unsubscribe_all() failed for %s", name,
-                             exc_info=True)
-            try:
-                pv.go_idle()
-            except Exception:
-                logger.debug("go_idle() failed for %s", name, exc_info=True)
+                logger.debug("disconnect() failed for %s", name, exc_info=True)
         self._pvs.clear()
