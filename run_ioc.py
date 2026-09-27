@@ -157,37 +157,32 @@ def main():
         camera.close()
         return
 
-    # $(TS)HDF5Location is subscribed IN-PROCESS by cam_plugin (see
-    # DetectorIOC.__init__ -> cam1.set_ts_prefix). No mirror subprocess.
-    import subprocess
-    pkg_root = os.path.dirname(os.path.abspath(__file__))
-    env = os.environ.copy()
-    env["PYTHONPATH"] = pkg_root + os.pathsep + env.get("PYTHONPATH", "")
-    subprocs = []
-
+    gui_proc = None
     if args.gui:
-        # GUI runs as a subprocess and connects to the IOC via CA/PVA.
         # Qt in the SAME process as the camera driver breaks PVCAM's DMA
         # signalling (Kinetix); process isolation avoids that entirely,
         # and is uniform across all camera backends.
+        import subprocess
         logger.info("Launching Qt GUI as subprocess (--prefix %s)",
                     args.prefix)
+        pkg_root = os.path.dirname(os.path.abspath(__file__))
+        env = os.environ.copy()
+        env["PYTHONPATH"] = pkg_root + os.pathsep + env.get("PYTHONPATH", "")
         gui_proc = subprocess.Popen(
             [sys.executable, "-m", "detectors.gui.qt_gui",
              "--prefix", args.prefix,
              "--log-level", args.log_level],
             env=env)
-        subprocs.append(("gui", gui_proc))
 
     logger.info("Serving %d PVs on %s", len(ioc.pvdb), args.interfaces)
     try:
         caproto_run(ioc.pvdb, interfaces=args.interfaces)
     finally:
-        for name, proc in subprocs:
+        if gui_proc is not None:
             try:
-                proc.terminate()
+                gui_proc.terminate()
             except Exception:
-                logger.debug("terminate() failed for %s", name, exc_info=True)
+                logger.debug("gui terminate failed", exc_info=True)
         camera.close()
 
 
