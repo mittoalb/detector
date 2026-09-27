@@ -30,7 +30,7 @@ vendor. Backends bind directly via `ctypes` — no vendor Python wrappers.
 ## Documentation
 
 Full docs (installation, per-camera notes, PVs, tomoscan integration,
-architecture, extending): **[detectors.readthedocs.io](https://detectors.readthedocs.io)**
+architecture, extending): **[detectors.readthedocs.io]([https://detectors.readthedocs.io](https://detector.readthedocs.io/en/latest/))**
 
 Build locally:
 
