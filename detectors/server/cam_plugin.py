@@ -72,9 +72,14 @@ class CamPlugin(PVGroup):
                               enum_strings=["Off", "On"])
     TriggerMode_RBV = pvproperty(value="Off", dtype=ChannelType.ENUM,
                                   enum_strings=["Off", "On"], read_only=True)
+    # Line0..Line3 are FLIR/Spinnaker hardware trigger inputs — tomoscan
+    # (tomoscan_32id.set_trigger_mode_oryx) puts 'Line2' here for PSO scans,
+    # and pyepics coerces to enum index, so the string MUST be listed.
+    # Without it: `ValueError: invalid literal for int() with base 0: b'Line2'`.
     TriggerSource = pvproperty(value="Internal", dtype=ChannelType.ENUM,
                                 enum_strings=["Internal", "External", "Software",
-                                              "MasterPulse"])
+                                              "MasterPulse",
+                                              "Line0", "Line1", "Line2", "Line3"])
     TriggerSoftware = pvproperty(value=0, dtype=int)
     TriggerOverlap = pvproperty(value="Off", dtype=ChannelType.ENUM,
                                  enum_strings=["Off", "ReadOut"])

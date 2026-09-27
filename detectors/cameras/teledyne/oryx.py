@@ -809,7 +809,7 @@ class TeledyneOryx(BaseCamera):
                 _set_enum_str(self._nodemap, "TriggerMode", "Off")
                 _set_enum_str(self._nodemap, "TriggerSource", "Software")
                 _set_enum_str(self._nodemap, "TriggerMode", "On")
-            elif v in ("External", "Line0", "Line1", "Line2"):
+            elif v in ("External", "Line0", "Line1", "Line2", "Line3"):
                 line = "Line0" if v == "External" else v
                 _set_enum_str(self._nodemap, "TriggerMode", "Off")
                 _set_enum_str(self._nodemap, "TriggerSource", line)
