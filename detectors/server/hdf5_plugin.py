@@ -63,6 +63,13 @@ def _to_str(val) -> str:
 
 from caproto.server import PVGroup, pvproperty
 
+from detectors.server.hdf5_layout import (
+    LayoutWriter,
+    ParsedLayout,
+    parse_layout_xml,
+)
+from detectors.server.nd_attributes import default_xml_search_paths
+
 logger = logging.getLogger(__name__)
 
 
@@ -126,6 +133,11 @@ class HDF5Plugin(PVGroup):
                                   enum_strings=["Idle", "Writing",
                                                 "Closing", "Error"],
                                   read_only=True)
+    # Layout-XML mode observability: "Empty" (no XML), "Loaded" (parsed OK),
+    # "Failed" (parse or load error), "Simple" (XML set but no ndattr
+    # snapshots arriving so we stayed in simple mode).
+    XMLLoaded_RBV = pvproperty(value="Empty", dtype=str, max_length=40,
+                                read_only=True)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -164,6 +176,16 @@ class HDF5Plugin(PVGroup):
         # Gates the "frame arrived while not capturing" warning so an
         # idle plugin (other format is selected) doesn't spam the log.
         self._ever_started = False
+        # Layout-XML mode (populated in _start_capture if XMLFileName +
+        # per-frame nd_attributes are both available). None → simple mode.
+        self._layout_writer: Optional[LayoutWriter] = None
+        # Only the most recent snapshot is retained — LayoutWriter.close
+        # only needs one representative view for OnFileClose datasets and
+        # the /defaults catch-all. Keeping every snapshot would grow O(N).
+        self._last_snapshot: Optional[dict] = None
+        # Search dirs for basename-only XML PV values (e.g. "TomoScanLayout.xml").
+        # Populated by set_layout_search_paths() from DetectorIOC.
+        self._layout_search_paths: list = []
 
     @NumCaptured_RBV.startup
     async def NumCaptured_RBV(self, instance, async_lib):
@@ -176,6 +198,61 @@ class HDF5Plugin(PVGroup):
         if self._async_loop is not None:
             asyncio.run_coroutine_threadsafe(prop.write(value),
                                               self._async_loop)
+
+    def set_layout_search_paths(self, paths: list) -> None:
+        """Directories to search for basename-only XMLFileName values.
+        Called by DetectorIOC at wiring time."""
+        self._layout_search_paths = list(paths)
+
+    def _resolve_layout_xml(self, xml_file: str) -> Optional[str]:
+        """Same lookup order as NDAttributesManager._resolve_path — env
+        AREA_DETECTOR_ATTRIBUTES_PATH, then constructor-provided search
+        dirs, then CWD, then auto-discovered synApps iocBoot dirs.
+        Returns None if not found (logs)."""
+        if not xml_file:
+            return None
+        p = Path(xml_file)
+        tried = []
+        if p.is_absolute():
+            tried.append(str(p))
+            if p.exists():
+                return str(p)
+        env = os.environ.get("AREA_DETECTOR_ATTRIBUTES_PATH", "")
+        env_dirs = [d for d in env.split(":") if d]
+        candidates = (env_dirs + list(self._layout_search_paths)
+                      + [os.getcwd()] + default_xml_search_paths())
+        seen = set()
+        for base in candidates:
+            if base in seen:
+                continue
+            seen.add(base)
+            candidate = Path(base) / xml_file
+            tried.append(str(candidate))
+            if candidate.exists():
+                return str(candidate)
+        logger.warning(
+            "XMLFileName %r not found — layout mode disabled. Tried:\n  %s",
+            xml_file, "\n  ".join(tried))
+        return None
+
+    def _try_load_layout(self) -> Optional[LayoutWriter]:
+        """Attempt to parse XMLFileName and return a LayoutWriter, else None."""
+        xml_file = _to_str(self.XMLFileName.value)
+        if not xml_file:
+            return None
+        resolved = self._resolve_layout_xml(xml_file)
+        if resolved is None:
+            self._publish(self.XMLLoaded_RBV, "Failed")
+            return None
+        try:
+            parsed: ParsedLayout = parse_layout_xml(resolved)
+        except Exception as exc:
+            logger.error("Layout XML parse failed for %s: %s", resolved, exc)
+            self._publish(self.XMLLoaded_RBV, "Failed")
+            return None
+        logger.info("HDF5 layout mode ENABLED from %s", resolved)
+        self._publish(self.XMLLoaded_RBV, "Loaded")
+        return LayoutWriter(parsed)
 
     @FilePath.putter
     async def FilePath(self, instance, value):
@@ -278,9 +355,11 @@ class HDF5Plugin(PVGroup):
         # Make a contiguous copy now: the underlying buffer may be reused
         # by the camera before the writer thread gets to it. Bundle the
         # FrameType from metadata so the writer can route to the right
-        # /exchange dataset.
+        # /exchange dataset. When layout mode is active, also bundle the
+        # NDAttributes snapshot the acquisition loop took at frame time.
         frame_type = metadata.get("frame_type", "Projection") if metadata else "Projection"
-        item = (frame_type, np.ascontiguousarray(frame))
+        snapshot = metadata.get("nd_attributes") if metadata else None
+        item = (frame_type, snapshot, np.ascontiguousarray(frame))
         # Camera-side counter: increments on every received frame, regardless
         # of whether the writer ultimately accepts or drops it. Together with
         # NumCaptured_RBV this exposes the receive-vs-write gap.
@@ -329,30 +408,49 @@ class HDF5Plugin(PVGroup):
                     continue
                 try:
                     num_capture = int(self.NumCapture.value)
-                    frame_type, frame = item
+                    frame_type, snapshot, frame = item
 
-                    ds, frame_type, path = self._get_or_create_dataset(
-                        frame_type, frame)
+                    # Layout mode: LayoutWriter routes on the snapshot's
+                    # HDF5FrameLocation, creates the file structure lazily
+                    # from the parsed XML, and manages HDF5 attributes.
+                    # We still write /defaults/{NDArrayUniqueId,HDF5FrameLocation}
+                    # from _unique_ids/_frame_locations at close for
+                    # tomoscan's add_theta backward compatibility.
+                    if self._layout_writer is not None and snapshot is not None:
+                        if not self._layout_writer._detector_datasets:
+                            # First frame of layout mode — write the file
+                            # structure (constants + OnFileOpen ndattrs)
+                            # using this snapshot.
+                            self._layout_writer.open(self._h5_file, snapshot)
+                        path = self._layout_writer.write_frame(
+                            self._h5_file, frame, snapshot)
+                        self._last_snapshot = snapshot
+                        self._frames_captured += 1
+                        self._unique_ids.append(self._frames_captured)
+                        self._frame_locations.append(path.encode("ascii"))
+                    else:
+                        ds, frame_type, path = self._get_or_create_dataset(
+                            frame_type, frame)
 
-                    # Grow the per-type dataset by 1 if needed.
-                    type_idx = self._dataset_counts[frame_type]
-                    if type_idx >= ds.shape[0]:
-                        ds.resize((type_idx + 1,) + ds.shape[1:])
+                        # Grow the per-type dataset by 1 if needed.
+                        type_idx = self._dataset_counts[frame_type]
+                        if type_idx >= ds.shape[0]:
+                            ds.resize((type_idx + 1,) + ds.shape[1:])
 
-                    if frame.shape != ds.shape[1:]:
-                        logger.warning(
-                            "HDF5: frame shape %s != dataset %s, skipping",
-                            frame.shape, ds.shape[1:])
-                        continue
+                        if frame.shape != ds.shape[1:]:
+                            logger.warning(
+                                "HDF5: frame shape %s != dataset %s, skipping",
+                                frame.shape, ds.shape[1:])
+                            continue
 
-                    ds[type_idx] = frame
-                    self._dataset_counts[frame_type] = type_idx + 1
+                        ds[type_idx] = frame
+                        self._dataset_counts[frame_type] = type_idx + 1
 
-                    # Tomoscan's add_theta needs one entry per frame in
-                    # the order frames were captured.
-                    self._frames_captured += 1
-                    self._unique_ids.append(self._frames_captured)
-                    self._frame_locations.append(path.encode("ascii"))
+                        # Tomoscan's add_theta needs one entry per frame in
+                        # the order frames were captured.
+                        self._frames_captured += 1
+                        self._unique_ids.append(self._frames_captured)
+                        self._frame_locations.append(path.encode("ascii"))
 
                     if self._frames_captured % self._flush_every == 0:
                         self._h5_file.flush()
@@ -455,6 +553,18 @@ class HDF5Plugin(PVGroup):
                 self._not_capturing_drops = 0
                 self._capturing = True
                 self._ever_started = True
+                # Layout mode: try to load XMLFileName. If it succeeds we'll
+                # enter layout mode on the first frame (once we have a
+                # snapshot to pass to LayoutWriter.open()). If XMLFileName
+                # is empty or parsing fails we stay in simple mode.
+                self._layout_writer = self._try_load_layout()
+                self._last_snapshot = None
+                if self._layout_writer is None and _to_str(
+                        self.XMLFileName.value):
+                    # XML was set but couldn't load — stay in simple mode
+                    self._publish(self.XMLLoaded_RBV, "Failed")
+                elif self._layout_writer is None:
+                    self._publish(self.XMLLoaded_RBV, "Empty")
                 self._publish(self.Capture_RBV, 1)
                 self._publish(self.WriteStatus, 0)  # Success
                 self._publish(self.WriteMessage, "Capturing")
@@ -558,19 +668,35 @@ class HDF5Plugin(PVGroup):
         with self._lock:
             if self._h5_file is not None:
                 try:
-                    # Trim each per-type dataset to actual frames written.
-                    for ftype, ds in self._h5_datasets.items():
-                        count = self._dataset_counts.get(ftype, 0)
-                        if count < ds.shape[0]:
-                            ds.resize((count,) + ds.shape[1:])
+                    # Layout mode close: LayoutWriter handles per-detector
+                    # dataset trimming, OnFileClose ndattr writes, and the
+                    # /defaults catch-all for un-consumed attributes.
+                    if self._layout_writer is not None:
+                        try:
+                            self._layout_writer.close(
+                                self._h5_file, self._last_snapshot)
+                        except Exception:
+                            logger.exception(
+                                "LayoutWriter.close failed — file may be "
+                                "missing OnFileClose datasets")
+                    else:
+                        # Simple-mode: trim each per-type dataset.
+                        for ftype, ds in self._h5_datasets.items():
+                            count = self._dataset_counts.get(ftype, 0)
+                            if count < ds.shape[0]:
+                                ds.resize((count,) + ds.shape[1:])
 
                     # Write per-frame index arrays that tomoscan's
                     # add_theta() reads to identify projections / flats /
                     # darks. Order matches the order frames were captured.
-                    if self._unique_ids:
+                    # These live at /defaults/NDArrayUniqueId and
+                    # /defaults/HDF5FrameLocation; LayoutWriter's catch-all
+                    # excludes these two names by design to avoid a clash.
+                    if self._unique_ids and "/defaults/NDArrayUniqueId" not in self._h5_file:
                         self._h5_file.create_dataset(
                             "/defaults/NDArrayUniqueId",
                             data=np.asarray(self._unique_ids, dtype=np.int32))
+                    if self._frame_locations and "/defaults/HDF5FrameLocation" not in self._h5_file:
                         # Fixed-length bytes (matches areaDetector). Width
                         # picked to fit the longest /exchange/* path used.
                         max_len = max(len(loc) for loc in self._frame_locations)
@@ -617,6 +743,8 @@ class HDF5Plugin(PVGroup):
                 finally:
                     self._h5_file = None
                     self._h5_datasets = {}
+                    self._layout_writer = None
+                    self._last_snapshot = None
 
         if _to_str(self.AutoIncrement.value) == "Yes":
             next_num = int(self.FileNumber.value) + 1

@@ -27,6 +27,7 @@ Usage:
 
 import argparse
 import logging
+import os
 import sys
 import threading
 
@@ -70,6 +71,21 @@ def main():
                              "running IOC at --prefix (no camera/IOC "
                              "startup). Use this to reopen the GUI after "
                              "closing its window.")
+    # NDAttributes / Layout-XML HDF5 mode: tomoscan's DetectorAttributes.xml
+    # references PVs on OTHER soft IOCs via macros. --ts-prefix names the
+    # tomoscan softioc's prefix so $(TS)... in the attributes XML resolves
+    # correctly. Extend this pattern for other macros (--txm-prefix etc.)
+    # if the XML references more IOCs.
+    parser.add_argument("--ts-prefix",
+                        default=os.environ.get("TS_PREFIX", "32id:TomoScan:"),
+                        help="TomoScan softioc PV prefix; substituted for "
+                             "$(TS) in the NDAttributes XML "
+                             "(default: %(default)s; env: TS_PREFIX).")
+    parser.add_argument("--xml-search-path", action="append", default=[],
+                        help="Directory to search when tomoscan puts an "
+                             "NDAttributes / layout XML basename. May be "
+                             "given multiple times. Also honors env "
+                             "AREA_DETECTOR_ATTRIBUTES_PATH.")
     args = parser.parse_args()
 
     # --gui-only: just spawn the GUI subprocess and wait, no IOC.
@@ -77,7 +93,6 @@ def main():
     # running IOC (which still serves PVs, PVA frames, and IPC).
     if args.gui_only:
         _install_color_logging(level=getattr(logging, args.log_level))
-        import os
         import subprocess
         logger = logging.getLogger(__name__)
         pkg_root = os.path.dirname(os.path.abspath(__file__))
@@ -135,7 +150,13 @@ def main():
 
     # Build IOC
     from detectors.server.ioc import DetectorIOC
-    ioc = DetectorIOC(prefix=args.prefix, camera=camera, pva_pv=args.pva_pv)
+    ioc = DetectorIOC(
+        prefix=args.prefix,
+        camera=camera,
+        pva_pv=args.pva_pv,
+        nd_attributes_macros={"TS": args.ts_prefix},
+        xml_search_paths=args.xml_search_path,
+    )
 
     if args.list_pvs:
         print(f"\nPVs served by {args.prefix} IOC:\n")
@@ -151,7 +172,6 @@ def main():
         # Qt in the SAME process as the camera driver breaks PVCAM's DMA
         # signalling (Kinetix); process isolation avoids that entirely,
         # and is uniform across all camera backends.
-        import os
         import subprocess
         logger.info("Launching Qt GUI as subprocess (--prefix %s)",
                     args.prefix)
