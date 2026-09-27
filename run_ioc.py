@@ -166,38 +166,56 @@ def main():
         camera.close()
         return
 
-    # Run IOC + optional GUI
+    # Spawn subprocess helpers (GUI + tomoscan_mirror). All use pyepics
+    # from a separate process so they don't have to share the caproto
+    # server's CA state — which in this environment proved unreliable
+    # for in-process CA client work.
+    import subprocess
+    pkg_root = os.path.dirname(os.path.abspath(__file__))
+    env = os.environ.copy()
+    env["PYTHONPATH"] = pkg_root + os.pathsep + env.get("PYTHONPATH", "")
+    subprocs = []
+
+    # Tomoscan mirror: forwards $(TS)FrameType -> $(DET)cam1:FrameType so
+    # the HDF5 plugin's per-frame routing lands frames in the correct
+    # /exchange/data* dataset (data, data_white, data_dark). Always
+    # spawned when --ts-prefix is set; harmless if tomoscan isn't up
+    # (mirror exits with a clear log message).
+    if args.ts_prefix:
+        logger.info("Launching tomoscan_mirror subprocess "
+                    "(TS=%s DET=%s)", args.ts_prefix, args.prefix)
+        mirror_proc = subprocess.Popen(
+            [sys.executable, "-m", "detectors.server.tomoscan_mirror",
+             "--ts-prefix", args.ts_prefix,
+             "--det-prefix", args.prefix,
+             "--log-level", args.log_level],
+            env=env)
+        subprocs.append(("tomoscan_mirror", mirror_proc))
+
     if args.gui:
         # GUI runs as a subprocess and connects to the IOC via CA/PVA.
         # Qt in the SAME process as the camera driver breaks PVCAM's DMA
         # signalling (Kinetix); process isolation avoids that entirely,
         # and is uniform across all camera backends.
-        import subprocess
         logger.info("Launching Qt GUI as subprocess (--prefix %s)",
                     args.prefix)
-        # Ensure the subprocess can import `detectors.*` regardless of
-        # the shell's cwd — the package lives next to this script.
-        pkg_root = os.path.dirname(os.path.abspath(__file__))
-        env = os.environ.copy()
-        env["PYTHONPATH"] = pkg_root + os.pathsep + env.get("PYTHONPATH", "")
         gui_proc = subprocess.Popen(
             [sys.executable, "-m", "detectors.gui.qt_gui",
              "--prefix", args.prefix,
              "--log-level", args.log_level],
             env=env)
+        subprocs.append(("gui", gui_proc))
 
-        logger.info("Serving %d PVs on %s", len(ioc.pvdb), args.interfaces)
-        try:
-            caproto_run(ioc.pvdb, interfaces=args.interfaces)
-        finally:
-            gui_proc.terminate()
-            camera.close()
-    else:
-        logger.info("Serving %d PVs on %s", len(ioc.pvdb), args.interfaces)
-        try:
-            caproto_run(ioc.pvdb, interfaces=args.interfaces)
-        finally:
-            camera.close()
+    logger.info("Serving %d PVs on %s", len(ioc.pvdb), args.interfaces)
+    try:
+        caproto_run(ioc.pvdb, interfaces=args.interfaces)
+    finally:
+        for name, proc in subprocs:
+            try:
+                proc.terminate()
+            except Exception:
+                logger.debug("terminate() failed for %s", name, exc_info=True)
+        camera.close()
 
 
 def _run_gui(ioc):
