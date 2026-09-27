@@ -339,6 +339,49 @@ class NDAttributesManager:
             "NDAttributesManager: %d subscriptions queued for %s",
             len(self._subs), self._loaded_path)
 
+        # Kick a background thread that waits for connections and
+        # updates the cache's "ever_connected" bit from pv.connected —
+        # so status() reports live truth, not "0 because the callback
+        # hasn't fired yet". Also lets us log per-PV failures.
+        t = threading.Thread(
+            target=self._connect_and_report,
+            daemon=True, name="ndattrs-connect")
+        t.start()
+
+    def _connect_and_report(
+        self, wait_seconds: float = 15.0, poll: float = 0.5,
+    ) -> None:
+        """Poll pv.connected up to wait_seconds. Mark ever_connected true
+        for every PV that reports connected; log any that never do."""
+        deadline = time.monotonic() + wait_seconds
+        remaining = dict(self._pvs)   # attr_name -> pv
+        connected_names: List[str] = []
+        while remaining and time.monotonic() < deadline:
+            for name in list(remaining):
+                pv = remaining[name]
+                if pv.connected:
+                    with self._lock:
+                        val, ts, _ever = self._values.get(
+                            name, (None, 0.0, False))
+                        self._values[name] = (val, ts, True)
+                    connected_names.append(name)
+                    del remaining[name]
+            if remaining:
+                time.sleep(poll)
+
+        n_conn = len(connected_names)
+        n_total = len(self._pvs)
+        logger.info(
+            "NDAttributesManager: %d/%d PVs connected within %.0fs",
+            n_conn, n_total, wait_seconds)
+        if remaining:
+            # Log up to 20 names so operators can spot which IOC is down
+            sample = list(remaining.items())[:20]
+            logger.warning(
+                "NDAttributesManager: %d PVs never connected. Examples:\n  %s",
+                len(remaining),
+                "\n  ".join(f"{n} -> {pv.name}" for n, pv in sample))
+
     def _make_callback(self, attr_name: str) -> Callable:
         # Bound closure so caproto's callback interface (sub, response)
         # gets routed to this manager's cache under a name key.

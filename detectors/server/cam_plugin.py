@@ -255,6 +255,10 @@ class CamPlugin(PVGroup):
         self._publish(self.NDAttributesStatus_RBV, status)
         self._publish(self.NDAttributesConnected_RBV, int(st.get("connected", 0)))
         self._publish(self.NDAttributesTotal_RBV, int(st.get("total", 0)))
+        # Also mirror the connected count into the poller so a periodic
+        # background refresh keeps the RBV live (see _status_poller_loop).
+        # Otherwise the count reflects only the instant NDAttributesFile
+        # was put — often 0 because caproto subscriptions hadn't fired yet.
 
     def _publish(self, prop, value):
         """Thread-safe PV update with monitor notification."""
@@ -308,6 +312,16 @@ class CamPlugin(PVGroup):
                 # Exposure — may have been clamped by the camera to a legal
                 # value distinct from what the user asked for.
                 self._publish_ro("ExposureTime", self.AcquireTime_RBV, float)
+            # Live NDAttributes connection count. Non-camera source, so
+            # runs independent of self._camera. Keeps Connected_RBV in
+            # sync with caproto subscriptions that arrive asynchronously
+            # after NDAttributesFile was put.
+            if self._nd_attrs is not None:
+                try:
+                    self._refresh_nd_attrs_status()
+                except Exception:
+                    logger.debug("nd_attrs status refresh failed",
+                                 exc_info=True)
             # Polling every 1s matches the GUI's _refresh_timer cadence
             self._poller_stop.wait(1.0)
 
