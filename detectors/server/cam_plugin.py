@@ -169,6 +169,16 @@ class CamPlugin(PVGroup):
         # can snapshot attributes per frame into metadata["nd_attributes"].
         # None means simple-writer mode (current behavior).
         self._nd_attrs = None
+        # Direct pyepics subscription to $(TS)HDF5Location — the PV
+        # tomoscan flips between "/exchange/data", "/exchange/data_white",
+        # "/exchange/data_dark" before each phase. We cache its value
+        # here and stuff it into metadata["hdf5_location"] on every frame,
+        # so the HDF5 plugin can use it verbatim as the dataset path
+        # with no FrameType enum indirection and no cross-IOC mirror.
+        # Set up in set_ts_prefix(); None until then.
+        self._ts_hdf5location_pv = None
+        self._ts_hdf5location_lock = threading.Lock()
+        self._ts_hdf5location_value: Optional[str] = None
 
     def set_camera(self, camera: Optional[BaseCamera]) -> None:
         """Bind a BaseCamera to this plugin."""
@@ -241,6 +251,43 @@ class CamPlugin(PVGroup):
         per frame and its output goes into metadata["nd_attributes"]."""
         self._nd_attrs = mgr
         self._refresh_nd_attrs_status()
+
+    def set_ts_prefix(self, ts_prefix: str) -> None:
+        """Subscribe to $(TS)HDF5Location via pyepics so per-frame
+        routing knows exactly which /exchange/* dataset each frame
+        belongs to. Called by DetectorIOC.__init__."""
+        if not ts_prefix:
+            return
+        try:
+            import epics  # pyepics — proven reliable in this env
+        except ImportError:
+            logger.error(
+                "pyepics not installed. HDF5Location sync disabled. "
+                "pip install pyepics to enable.")
+            return
+        src = ts_prefix + "HDF5Location"
+
+        def _cb(pvname=None, value=None, char_value=None, **kw):
+            v = char_value if char_value else value
+            if isinstance(v, bytes):
+                v = v.decode("utf-8", "replace").rstrip("\x00")
+            elif hasattr(v, "tobytes"):   # numpy uint8 array (CHAR waveform)
+                try:
+                    v = v.tobytes().decode("ascii", "replace").rstrip("\x00")
+                except Exception:
+                    return
+            elif not isinstance(v, str):
+                v = str(v)
+            v = v.strip()
+            if not v:
+                return
+            with self._ts_hdf5location_lock:
+                self._ts_hdf5location_value = v
+            logger.info("cam_plugin: HDF5Location update: %s = %s", src, v)
+
+        self._ts_hdf5location_pv = epics.PV(
+            src, callback=_cb, auto_monitor=True)
+        logger.info("cam_plugin: pyepics subscription to %s created", src)
 
     def _refresh_nd_attrs_status(self) -> None:
         if self._nd_attrs is None:
@@ -638,12 +685,18 @@ class CamPlugin(PVGroup):
                     frame_type = str(self.FrameType.value)
                 except Exception:
                     frame_type = "Projection"
+                # Read the cached $(TS)HDF5Location — the authoritative
+                # path tomoscan wants each frame written to. Takes
+                # precedence over frame_type in the HDF5 plugin.
+                with self._ts_hdf5location_lock:
+                    hdf5_location = self._ts_hdf5location_value
                 metadata = {
                     "timestamp": time.time(),
                     "frame_number": self._frame_counter,
                     "width": frame.shape[1],
                     "height": frame.shape[0],
                     "frame_type": frame_type,
+                    "hdf5_location": hdf5_location,   # may be None
                 }
                 # Snapshot NDAttributes (layout-XML HDF5 mode) into
                 # metadata so every downstream plugin sees the SAME frame-

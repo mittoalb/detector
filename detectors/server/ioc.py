@@ -64,6 +64,13 @@ class DetectorIOC(PVGroup):
         self.cam1.set_nd_attributes_manager(self._nd_attrs)
         # HDF5 plugin needs the same search paths to resolve XMLFileName
         self.HDF1.set_layout_search_paths(search)
+        # Direct pyepics subscription to $(TS)HDF5Location — this is the
+        # authoritative per-frame routing key from tomoscan. Snapshotted
+        # into every frame's metadata so the HDF5 writer picks the right
+        # /exchange/* dataset without racing an intermediate mirror PV.
+        ts_prefix = macros.get("TS", "")
+        if ts_prefix and "$(" not in ts_prefix:
+            self.cam1.set_ts_prefix(ts_prefix)
 
         self.cam1.register_frame_callback(self.HDF1.on_frame)
         # When acquisition ends, close HDF5 only if NumCapture target was

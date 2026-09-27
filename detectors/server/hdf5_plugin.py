@@ -277,26 +277,44 @@ class HDF5Plugin(PVGroup):
             return 0
         return value
 
-    def _get_or_create_dataset(self, frame_type: str, frame: np.ndarray):
+    def _get_or_create_dataset(self, frame_type: str, frame: np.ndarray,
+                                 explicit_path: Optional[str] = None):
         """Lazily create a per-frame-type dataset on first frame.
 
-        Returns the dataset, or None if the frame_type is unrecognized.
-        """
-        path = _FRAME_TYPE_TO_DATASET.get(frame_type)
-        if path is None:
-            logger.warning("Unknown FrameType=%r; routing to /exchange/data",
-                            frame_type)
-            path = "/exchange/data"
-            frame_type = "Projection"
+        Routing precedence (highest first):
+          1. `explicit_path` — the string cam_plugin captured from
+             $(TS)HDF5Location at frame arrival time. No enum
+             indirection, no race. This is the ONLY reliable source
+             during tomoscan fly scans.
+          2. `frame_type` mapped via _FRAME_TYPE_TO_DATASET (legacy
+             simple-mode fallback used when tomoscan isn't running or
+             the pyepics subscription hasn't primed yet).
+          3. `/exchange/data` fallback for unknown frame types.
 
-        ds = self._h5_datasets.get(frame_type)
+        Returns (dataset, key_used_for_dict, path).
+        """
+        if explicit_path:
+            path = explicit_path.strip()
+            key = path        # use the path itself as the dict key so
+                              # each unique location gets its own dataset
+        else:
+            path = _FRAME_TYPE_TO_DATASET.get(frame_type)
+            if path is None:
+                logger.warning(
+                    "Unknown FrameType=%r; routing to /exchange/data",
+                    frame_type)
+                path = "/exchange/data"
+                frame_type = "Projection"
+            key = frame_type
+
+        ds = self._h5_datasets.get(key)
         if ds is None:
-            try:
-                num_capture = int(self.NumCapture.value)
-            except Exception:
-                num_capture = 0
             h, w = frame.shape[0], frame.shape[1]
-            # Initial size: 1 frame, grows on resize. Chunked along frame axis.
+            # Ensure parent group exists (e.g. /exchange).
+            parent = path.rsplit("/", 1)[0]
+            if parent and parent not in self._h5_file:
+                self._h5_file.create_group(parent)
+            # Initial size: 1 frame, grows on resize. Chunked per-frame.
             ds = self._h5_file.create_dataset(
                 path,
                 shape=(1, h, w),
@@ -304,10 +322,10 @@ class HDF5Plugin(PVGroup):
                 dtype=frame.dtype,
                 chunks=(1, h, w),
             )
-            self._h5_datasets[frame_type] = ds
-            self._dataset_counts[frame_type] = 0
+            self._h5_datasets[key] = ds
+            self._dataset_counts[key] = 0
             logger.info("HDF5: created dataset %s", path)
-        return ds, frame_type, path
+        return ds, key, path
 
     def on_frame(self, frame: np.ndarray, metadata: dict) -> None:
         """Frame callback — non-blocking enqueue to background writer."""
@@ -352,14 +370,16 @@ class HDF5Plugin(PVGroup):
                 target=self._writer_loop, daemon=True, name="hdf5-writer")
             self._write_thread.start()
 
-        # Make a contiguous copy now: the underlying buffer may be reused
-        # by the camera before the writer thread gets to it. Bundle the
-        # FrameType from metadata so the writer can route to the right
-        # /exchange dataset. When layout mode is active, also bundle the
-        # NDAttributes snapshot the acquisition loop took at frame time.
+        # Bundle everything the writer needs to route this frame.
+        # `hdf5_location` (from $(TS)HDF5Location, snapshotted at frame
+        # arrival) is authoritative — no race. `frame_type` is the
+        # fallback if the location isn't primed. `snapshot` is the
+        # NDAttributes cache for layout mode.
         frame_type = metadata.get("frame_type", "Projection") if metadata else "Projection"
+        hdf5_location = metadata.get("hdf5_location") if metadata else None
         snapshot = metadata.get("nd_attributes") if metadata else None
-        item = (frame_type, snapshot, np.ascontiguousarray(frame))
+        item = (frame_type, hdf5_location, snapshot,
+                np.ascontiguousarray(frame))
         # Camera-side counter: increments on every received frame, regardless
         # of whether the writer ultimately accepts or drops it. Together with
         # NumCaptured_RBV this exposes the receive-vs-write gap.
@@ -408,19 +428,19 @@ class HDF5Plugin(PVGroup):
                     continue
                 try:
                     num_capture = int(self.NumCapture.value)
-                    frame_type, snapshot, frame = item
+                    frame_type, hdf5_location, snapshot, frame = item
 
-                    # Layout mode: LayoutWriter routes on the snapshot's
-                    # HDF5FrameLocation, creates the file structure lazily
-                    # from the parsed XML, and manages HDF5 attributes.
-                    # We still write /defaults/{NDArrayUniqueId,HDF5FrameLocation}
-                    # from _unique_ids/_frame_locations at close for
-                    # tomoscan's add_theta backward compatibility.
-                    if self._layout_writer is not None and snapshot is not None:
+                    # Route this frame. Precedence:
+                    #   1. hdf5_location (from $(TS)HDF5Location, snapshotted
+                    #      by cam_plugin at frame arrival) — authoritative.
+                    #   2. layout mode via NDAttributes snapshot.
+                    #   3. FrameType enum via _FRAME_TYPE_TO_DATASET.
+                    if hdf5_location:
+                        ds, key, path = self._get_or_create_dataset(
+                            frame_type, frame,
+                            explicit_path=hdf5_location)
+                    elif self._layout_writer is not None and snapshot is not None:
                         if not self._layout_writer._detector_datasets:
-                            # First frame of layout mode — write the file
-                            # structure (constants + OnFileOpen ndattrs)
-                            # using this snapshot.
                             self._layout_writer.open(self._h5_file, snapshot)
                         path = self._layout_writer.write_frame(
                             self._h5_file, frame, snapshot)
@@ -428,29 +448,42 @@ class HDF5Plugin(PVGroup):
                         self._frames_captured += 1
                         self._unique_ids.append(self._frames_captured)
                         self._frame_locations.append(path.encode("ascii"))
+                        # Legacy layout-mode path doesn't touch
+                        # _h5_datasets or resize, so continue past the
+                        # simple-mode write below.
+                        if self._frames_captured % self._flush_every == 0:
+                            self._h5_file.flush()
+                        self._publish(self.NumCaptured_RBV,
+                                       self._frames_captured)
+                        if num_capture > 0 and self._frames_captured >= num_capture:
+                            logger.info(
+                                "writer_loop: target reached (%d >= %d), closing file",
+                                self._frames_captured, num_capture)
+                            self._capturing = False
+                            self._stop_capture()
+                            return
+                        continue
                     else:
-                        ds, frame_type, path = self._get_or_create_dataset(
+                        ds, key, path = self._get_or_create_dataset(
                             frame_type, frame)
 
-                        # Grow the per-type dataset by 1 if needed.
-                        type_idx = self._dataset_counts[frame_type]
-                        if type_idx >= ds.shape[0]:
-                            ds.resize((type_idx + 1,) + ds.shape[1:])
+                    # Common append path for simple mode + explicit-path mode
+                    type_idx = self._dataset_counts[key]
+                    if type_idx >= ds.shape[0]:
+                        ds.resize((type_idx + 1,) + ds.shape[1:])
+                    if frame.shape != ds.shape[1:]:
+                        logger.warning(
+                            "HDF5: frame shape %s != dataset %s, skipping",
+                            frame.shape, ds.shape[1:])
+                        continue
+                    ds[type_idx] = frame
+                    self._dataset_counts[key] = type_idx + 1
 
-                        if frame.shape != ds.shape[1:]:
-                            logger.warning(
-                                "HDF5: frame shape %s != dataset %s, skipping",
-                                frame.shape, ds.shape[1:])
-                            continue
-
-                        ds[type_idx] = frame
-                        self._dataset_counts[frame_type] = type_idx + 1
-
-                        # Tomoscan's add_theta needs one entry per frame in
-                        # the order frames were captured.
-                        self._frames_captured += 1
-                        self._unique_ids.append(self._frames_captured)
-                        self._frame_locations.append(path.encode("ascii"))
+                    # Tomoscan's add_theta needs one entry per frame in
+                    # the order frames were captured.
+                    self._frames_captured += 1
+                    self._unique_ids.append(self._frames_captured)
+                    self._frame_locations.append(path.encode("ascii"))
 
                     if self._frames_captured % self._flush_every == 0:
                         self._h5_file.flush()

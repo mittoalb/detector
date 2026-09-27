@@ -166,31 +166,13 @@ def main():
         camera.close()
         return
 
-    # Spawn subprocess helpers (GUI + tomoscan_mirror). All use pyepics
-    # from a separate process so they don't have to share the caproto
-    # server's CA state — which in this environment proved unreliable
-    # for in-process CA client work.
+    # $(TS)HDF5Location is subscribed IN-PROCESS by cam_plugin (see
+    # DetectorIOC.__init__ -> cam1.set_ts_prefix). No mirror subprocess.
     import subprocess
     pkg_root = os.path.dirname(os.path.abspath(__file__))
     env = os.environ.copy()
     env["PYTHONPATH"] = pkg_root + os.pathsep + env.get("PYTHONPATH", "")
     subprocs = []
-
-    # Tomoscan mirror: forwards $(TS)FrameType -> $(DET)cam1:FrameType so
-    # the HDF5 plugin's per-frame routing lands frames in the correct
-    # /exchange/data* dataset (data, data_white, data_dark). Always
-    # spawned when --ts-prefix is set; harmless if tomoscan isn't up
-    # (mirror exits with a clear log message).
-    if args.ts_prefix:
-        logger.info("Launching tomoscan_mirror subprocess "
-                    "(TS=%s DET=%s)", args.ts_prefix, args.prefix)
-        mirror_proc = subprocess.Popen(
-            [sys.executable, "-m", "detectors.server.tomoscan_mirror",
-             "--ts-prefix", args.ts_prefix,
-             "--det-prefix", args.prefix,
-             "--log-level", args.log_level],
-            env=env)
-        subprocs.append(("tomoscan_mirror", mirror_proc))
 
     if args.gui:
         # GUI runs as a subprocess and connects to the IOC via CA/PVA.
