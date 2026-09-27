@@ -54,6 +54,9 @@ detectors-cli = "detectors.cli:main"
 where = ["."]
 include = ["detectors*"]
 
+[tool.setuptools.package-data]
+detectors = ["*.json"]
+
 [tool.black]
 line-length = 88
 target-version = ['py38']

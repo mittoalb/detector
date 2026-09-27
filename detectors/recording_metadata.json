@@ -1,0 +1,23 @@
+{
+  "recording": {
+    "started":        {"auto": "started"},
+    "stopped":        {"auto": "stopped"},
+    "frame_count":    {"auto": "frame_count"},
+    "dropped_frames": {"auto": "dropped_count"},
+    "output_dir":     {"auto": "output_dir"}
+  },
+  "camera": {
+    "prefix":     {"value": "32idbSP1:cam1"},
+    "exposure_s": {"pv": "32idbSP1:cam1:AcquireTime_RBV"},
+    "bin_x":      {"pv": "32idbSP1:cam1:BinX_RBV"},
+    "bin_y":      {"pv": "32idbSP1:cam1:BinY_RBV"},
+    "size_x":     {"pv": "32idbSP1:cam1:SizeX_RBV"},
+    "size_y":     {"pv": "32idbSP1:cam1:SizeY_RBV"},
+    "max_size_x": {"pv": "32idbSP1:cam1:MaxSizeX_RBV"},
+    "max_size_y": {"pv": "32idbSP1:cam1:MaxSizeY_RBV"}
+  },
+  "beamline": {
+    "name":     {"value": "APS 32-ID"},
+    "operator": {"value": "USERTXM"}
+  }
+}
