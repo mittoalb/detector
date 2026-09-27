@@ -288,6 +288,11 @@ class TIFFPlugin(PVGroup):
                 "TIFF start: path='%s' name='%s' start_num=%d auto_inc=%s",
                 self._dir, self._base_name, self._file_number_start, auto_inc)
 
+            if not self._dir:
+                logger.error("TIFF start: FilePath is empty — refusing to write")
+                self._publish(self.WriteStatus, 1)
+                self._publish(self.WriteMessage, "FilePath empty")
+                return
             try:
                 Path(self._dir).mkdir(parents=True, exist_ok=True)
             except Exception as exc:

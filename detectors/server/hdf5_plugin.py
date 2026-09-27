@@ -51,7 +51,15 @@ def _to_str(val) -> str:
 
     `pvproperty(dtype=str, max_length=N)` may return a numpy array of bytes
     (CHAR array) instead of a Python string. This handles all forms.
+
+    Returns "" for None / other non-stringifiable garbage. Historically
+    the ``except`` branch returned ``str(val)`` which turned ``None``
+    into the literal ``"None"`` — callers then mkdir'd a directory
+    named ``None`` in the cwd. Empty string is safe here because every
+    caller already refuses to write when the resulting path is empty.
     """
+    if val is None:
+        return ""
     if isinstance(val, str):
         return val
     if isinstance(val, bytes):
@@ -59,7 +67,7 @@ def _to_str(val) -> str:
     try:
         return bytes(val).decode("ascii", errors="replace").rstrip("\x00")
     except Exception:
-        return str(val)
+        return ""
 
 from caproto.server import PVGroup, pvproperty
 
@@ -422,6 +430,9 @@ class HDF5Plugin(PVGroup):
             logger.info("HDF5 start: path='%s' name='%s' num=%d auto_inc=%s",
                          file_path, file_name, file_num, auto_inc)
 
+            if not file_path:
+                logger.error("HDF5 start: FilePath is empty — refusing to write")
+                return
             try:
                 Path(file_path).mkdir(parents=True, exist_ok=True)
             except Exception as exc:
