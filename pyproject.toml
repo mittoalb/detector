@@ -33,8 +33,8 @@ camera = [
 epics = [
     "caproto>=1.3.0",
     "h5py>=3.0.0",
-    # pyepics used by NDAttributesManager as its CA client (in-process
-    # caproto client failed to discover PVs in the 32-ID environment).
+    # cam_plugin subscribes to $(TS)HDF5Location via pyepics — in-process
+    # caproto client wasn't reliable enough in the 32-ID environment.
     "pyepics>=3.5.0",
 ]
 save = [

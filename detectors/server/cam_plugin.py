@@ -111,13 +111,9 @@ class CamPlugin(PVGroup):
 
     # Plugin support
     WaitForPlugins = pvproperty(value="No", dtype=str, max_length=40)
+    # Stubs — tomoscan writes here but we don't act on it.
     NDAttributesFile = pvproperty(value="", dtype=str, max_length=256)
     NDAttributesMacros = pvproperty(value="", dtype=str, max_length=256)
-    # Observability for the NDAttributes subsystem (layout-XML HDF5 mode)
-    NDAttributesStatus_RBV = pvproperty(
-        value="Empty", dtype=str, max_length=40, read_only=True)
-    NDAttributesConnected_RBV = pvproperty(value=0, dtype=int, read_only=True)
-    NDAttributesTotal_RBV = pvproperty(value=0, dtype=int, read_only=True)
     UniqueIdMode = pvproperty(value="Camera", dtype=ChannelType.ENUM,
                                enum_strings=["Driver", "User", "Camera",
                                              "FileNumber"])
@@ -164,17 +160,11 @@ class CamPlugin(PVGroup):
         # and displays them in its Status panel.
         self._poller_thread: Optional[threading.Thread] = None
         self._poller_stop = threading.Event()
-        # NDAttributes manager for layout-XML-driven HDF5 mode. Set by
-        # DetectorIOC.__init__ via set_nd_attributes_manager() so cam_plugin
-        # can snapshot attributes per frame into metadata["nd_attributes"].
-        # None means simple-writer mode (current behavior).
-        self._nd_attrs = None
         # Direct pyepics subscription to $(TS)HDF5Location — the PV
         # tomoscan flips between "/exchange/data", "/exchange/data_white",
         # "/exchange/data_dark" before each phase. We cache its value
         # here and stuff it into metadata["hdf5_location"] on every frame,
-        # so the HDF5 plugin can use it verbatim as the dataset path
-        # with no FrameType enum indirection and no cross-IOC mirror.
+        # so the HDF5 plugin can use it verbatim as the dataset path.
         # Set up in set_ts_prefix(); None until then.
         self._ts_hdf5location_pv = None
         self._ts_hdf5location_lock = threading.Lock()
@@ -246,12 +236,6 @@ class CamPlugin(PVGroup):
         """Register a callback called when acquisition stops (any reason)."""
         self._end_callbacks.append(callback)
 
-    def set_nd_attributes_manager(self, mgr) -> None:
-        """Attach a NDAttributesManager. When set, snapshot() is called
-        per frame and its output goes into metadata["nd_attributes"]."""
-        self._nd_attrs = mgr
-        self._refresh_nd_attrs_status()
-
     def set_ts_prefix(self, ts_prefix: str) -> None:
         """Subscribe to $(TS)HDF5Location via pyepics so per-frame
         routing knows exactly which /exchange/* dataset each frame
@@ -288,24 +272,6 @@ class CamPlugin(PVGroup):
         self._ts_hdf5location_pv = epics.PV(
             src, callback=_cb, auto_monitor=True)
         logger.info("cam_plugin: pyepics subscription to %s created", src)
-
-    def _refresh_nd_attrs_status(self) -> None:
-        if self._nd_attrs is None:
-            self._publish(self.NDAttributesStatus_RBV, "Empty")
-            self._publish(self.NDAttributesConnected_RBV, 0)
-            self._publish(self.NDAttributesTotal_RBV, 0)
-            return
-        st = self._nd_attrs.status()
-        status = "Loaded" if st.get("loaded_path") else "Failed"
-        if st.get("load_error"):
-            status = "Failed"
-        self._publish(self.NDAttributesStatus_RBV, status)
-        self._publish(self.NDAttributesConnected_RBV, int(st.get("connected", 0)))
-        self._publish(self.NDAttributesTotal_RBV, int(st.get("total", 0)))
-        # Also mirror the connected count into the poller so a periodic
-        # background refresh keeps the RBV live (see _status_poller_loop).
-        # Otherwise the count reflects only the instant NDAttributesFile
-        # was put — often 0 because caproto subscriptions hadn't fired yet.
 
     def _publish(self, prop, value):
         """Thread-safe PV update with monitor notification."""
@@ -359,16 +325,6 @@ class CamPlugin(PVGroup):
                 # Exposure — may have been clamped by the camera to a legal
                 # value distinct from what the user asked for.
                 self._publish_ro("ExposureTime", self.AcquireTime_RBV, float)
-            # Live NDAttributes connection count. Non-camera source, so
-            # runs independent of self._camera. Keeps Connected_RBV in
-            # sync with caproto subscriptions that arrive asynchronously
-            # after NDAttributesFile was put.
-            if self._nd_attrs is not None:
-                try:
-                    self._refresh_nd_attrs_status()
-                except Exception:
-                    logger.debug("nd_attrs status refresh failed",
-                                 exc_info=True)
             # Polling every 1s matches the GUI's _refresh_timer cadence
             self._poller_stop.wait(1.0)
 
@@ -535,25 +491,6 @@ class CamPlugin(PVGroup):
         await self.TriggerDelay_RBV.write(v)
         return v
 
-    @NDAttributesFile.putter
-    async def NDAttributesFile(self, instance, value):
-        """When tomoscan puts a basename (e.g. 'TomoScanDetectorAttributes.xml'),
-        reload the NDAttributesManager to build fresh CA subscriptions."""
-        if isinstance(value, (list, tuple)):
-            value = value[0] if value else ""
-        if isinstance(value, bytes):
-            value = value.decode("utf-8", errors="replace")
-        v = str(value).rstrip("\x00").strip()
-        if self._nd_attrs is None or not v:
-            return v
-        try:
-            self._nd_attrs.load(v)
-            logger.info("NDAttributesFile loaded: %s", v)
-        except Exception as exc:
-            logger.error("NDAttributesFile load failed for %s: %s", v, exc)
-        self._refresh_nd_attrs_status()
-        return v
-
     @PixelFormat.putter
     async def PixelFormat(self, instance, value):
         v = str(value)
@@ -698,19 +635,6 @@ class CamPlugin(PVGroup):
                     "frame_type": frame_type,
                     "hdf5_location": hdf5_location,   # may be None
                 }
-                # Snapshot NDAttributes (layout-XML HDF5 mode) into
-                # metadata so every downstream plugin sees the SAME frame-
-                # aligned view. Snapshot is a property of the frame — not
-                # of any one plugin. Non-blocking; disconnected PVs surface
-                # as None. If no manager attached, key is absent.
-                if self._nd_attrs is not None:
-                    try:
-                        self._nd_attrs.update_uid(self._frame_counter)
-                        metadata["nd_attributes"] = self._nd_attrs.snapshot(
-                            uid=self._frame_counter)
-                    except Exception:
-                        logger.exception("nd_attrs snapshot failed")
-
                 # Update counters every frame (small, cheap)
                 self._publish(self.NumImagesCounter_RBV, self._frame_counter)
                 self._publish(self.ArrayCounter_RBV, self._frame_counter)

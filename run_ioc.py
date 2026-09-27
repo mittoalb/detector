@@ -71,21 +71,13 @@ def main():
                              "running IOC at --prefix (no camera/IOC "
                              "startup). Use this to reopen the GUI after "
                              "closing its window.")
-    # NDAttributes / Layout-XML HDF5 mode: tomoscan's DetectorAttributes.xml
-    # references PVs on OTHER soft IOCs via macros. --ts-prefix names the
-    # tomoscan softioc's prefix so $(TS)... in the attributes XML resolves
-    # correctly. Extend this pattern for other macros (--txm-prefix etc.)
-    # if the XML references more IOCs.
+    # TomoScan softioc prefix. Cam_plugin subscribes to
+    # <ts-prefix>HDF5Location and snapshots it per frame so the HDF5
+    # writer routes frames to /exchange/data{,_white,_dark}.
     parser.add_argument("--ts-prefix",
                         default=os.environ.get("TS_PREFIX", "32id:TomoScan:"),
-                        help="TomoScan softioc PV prefix; substituted for "
-                             "$(TS) in the NDAttributes XML "
+                        help="TomoScan softioc PV prefix "
                              "(default: %(default)s; env: TS_PREFIX).")
-    parser.add_argument("--xml-search-path", action="append", default=[],
-                        help="Directory to search when tomoscan puts an "
-                             "NDAttributes / layout XML basename. May be "
-                             "given multiple times. Also honors env "
-                             "AREA_DETECTOR_ATTRIBUTES_PATH.")
     args = parser.parse_args()
 
     # --gui-only: just spawn the GUI subprocess and wait, no IOC.
@@ -154,8 +146,7 @@ def main():
         prefix=args.prefix,
         camera=camera,
         pva_pv=args.pva_pv,
-        nd_attributes_macros={"TS": args.ts_prefix},
-        xml_search_paths=args.xml_search_path,
+        ts_prefix=args.ts_prefix,
     )
 
     if args.list_pvs:

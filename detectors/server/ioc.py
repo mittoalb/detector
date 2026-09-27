@@ -3,8 +3,7 @@ Camera-agnostic EPICS IOC for areaDetector compatibility.
 """
 
 import logging
-import os
-from typing import Dict, List, Optional
+from typing import Optional
 
 from caproto.server import PVGroup, SubGroup
 
@@ -12,7 +11,6 @@ from detectors.core.base import BaseCamera
 from detectors.server.cam_plugin import CamPlugin
 from detectors.server.hdf5_plugin import HDF5Plugin
 from detectors.server.ipc import CameraIPCServer, socket_path_for
-from detectors.server.nd_attributes import NDAttributesManager
 from detectors.server.ntnda_server import NTNDArrayServer
 from detectors.server.tiff_plugin import TIFFPlugin
 
@@ -41,35 +39,18 @@ class DetectorIOC(PVGroup):
     def __init__(self, *args,
                  camera: Optional[BaseCamera] = None,
                  pva_pv: Optional[str] = None,
-                 nd_attributes_macros: Optional[Dict[str, str]] = None,
-                 xml_search_paths: Optional[List[str]] = None,
+                 ts_prefix: Optional[str] = None,
                  **kwargs):
         super().__init__(*args, **kwargs)
 
         self.camera = camera
         self.cam1.set_camera(camera)
-
-        # Build the NDAttributesManager. It's alive for the IOC's lifetime
-        # (not per-capture) so CA subscriptions stay warm across scans.
-        # Tomoscan puts a basename into cam1:NDAttributesFile at scan start;
-        # that putter triggers .load() on this shared manager.
-        prefix = self.prefix if hasattr(self, "prefix") else ""
-        macros = dict(nd_attributes_macros or {})
-        macros.setdefault("DET", prefix)
-        # Search paths: the shell's CWD (for tomoscan's basename puts) plus
-        # any caller-provided dirs.
-        search = list(xml_search_paths or []) + [os.getcwd()]
-        self._nd_attrs = NDAttributesManager(
-            macros=macros, search_paths=search)
-        self.cam1.set_nd_attributes_manager(self._nd_attrs)
-        # HDF5 plugin needs the same search paths to resolve XMLFileName
-        self.HDF1.set_layout_search_paths(search)
-        # Direct pyepics subscription to $(TS)HDF5Location — this is the
-        # authoritative per-frame routing key from tomoscan. Snapshotted
-        # into every frame's metadata so the HDF5 writer picks the right
-        # /exchange/* dataset without racing an intermediate mirror PV.
-        ts_prefix = macros.get("TS", "")
-        if ts_prefix and "$(" not in ts_prefix:
+        # In-process pyepics subscription to $(TS)HDF5Location — the
+        # per-frame routing string tomoscan writes. Cam_plugin snapshots
+        # it into each frame's metadata so the HDF5 writer puts the
+        # frame straight into /exchange/data, /exchange/data_white,
+        # or /exchange/data_dark with no race and no XML.
+        if ts_prefix:
             self.cam1.set_ts_prefix(ts_prefix)
 
         self.cam1.register_frame_callback(self.HDF1.on_frame)
