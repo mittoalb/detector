@@ -1,0 +1,15 @@
+{
+  "_description": "HDF5 layout for detectors' own HDF5 writer. Maps each acquired FrameType to its dataset path. Edit freely — the plugin reads this at every capture start. No AreaDetector XML dependency.",
+
+  "frame_types": {
+    "Projection": "/exchange/data",
+    "FlatField":  "/exchange/data_white",
+    "DarkField":  "/exchange/data_dark"
+  },
+
+  "root_attrs": {
+    "creator":  {"value": "detectors HDF5 plugin"},
+    "started":  {"auto": "iso_started"},
+    "stopped":  {"auto": "iso_stopped"}
+  }
+}

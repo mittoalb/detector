@@ -4,13 +4,14 @@ HDF5 file writer plugin (HDF1:) — areaDetector-compatible.
 Writes acquired frames to HDF5 files at /exchange/data dataset.
 """
 
+import json
 import logging
 import os
 import queue
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 # Disable HDF5's POSIX file locking BEFORE h5py imports the libhdf5 it
 # delegates to. HDF5 1.10+ takes an exclusive POSIX advisory lock on every
@@ -74,13 +75,47 @@ from caproto.server import PVGroup, pvproperty
 logger = logging.getLogger(__name__)
 
 
-# FrameType -> HDF5 dataset path. Tomoscan's add_theta() reads
-# /defaults/HDF5FrameLocation and matches these exact strings.
-_FRAME_TYPE_TO_DATASET = {
+# FrameType -> HDF5 dataset path.
+#
+# Loaded from `detectors/hdf5_layout.json` — shipped with the package,
+# editable in place. Tomoscan's add_theta() reads
+# /defaults/HDF5FrameLocation and matches whatever strings live under
+# `frame_types` in that JSON. If the JSON is missing / unreadable, we
+# fall back to the historical hardcoded map so writing never fails
+# just because the layout file went missing.
+
+_FRAME_TYPE_FALLBACK = {
     "Projection": "/exchange/data",
     "FlatField":  "/exchange/data_white",
     "DarkField":  "/exchange/data_dark",
 }
+
+
+def _layout_json_path() -> str:
+    return os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "hdf5_layout.json",
+    )
+
+
+def _load_layout() -> Dict:
+    path = _layout_json_path()
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("layout root is not a dict")
+        return data
+    except FileNotFoundError:
+        logger.warning("HDF5 layout %s not found — using fallback", path)
+    except Exception as e:
+        logger.warning("HDF5 layout %s load failed (%s) — using fallback", path, e)
+    return {"frame_types": _FRAME_TYPE_FALLBACK, "root_attrs": {}}
+
+
+_LAYOUT = _load_layout()
+_FRAME_TYPE_TO_DATASET = dict(_LAYOUT.get("frame_types") or _FRAME_TYPE_FALLBACK)
+_ROOT_ATTRS = dict(_LAYOUT.get("root_attrs") or {})
 
 
 class HDF5Plugin(PVGroup):
