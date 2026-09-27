@@ -532,13 +532,20 @@ class HDF5Plugin(PVGroup):
                 # advisory lock on this file. Belt-and-suspenders with the
                 # HDF5_USE_FILE_LOCKING env var set at module import.
                 # Older h5py raises on the locking kwarg → fall back.
+                #
+                # NOTE: libver is deliberately left at the h5py default
+                # ("earliest"). We tried libver="latest" earlier — it
+                # writes the newer superblock, which stamps a "file is
+                # being written" status flag that stays set if the IOC
+                # is killed mid-write. Readers (tomocupy, tomogui) then
+                # fail with "file is already open for write (may use
+                # <h5clear file> to clear file consistency flags)".
+                # Since we don't use SWMR, "latest" bought us nothing.
                 try:
                     self._h5_file = h5py.File(full_name, "w",
-                                               libver="latest",
                                                locking=False)
                 except TypeError:
-                    self._h5_file = h5py.File(full_name, "w",
-                                               libver="latest")
+                    self._h5_file = h5py.File(full_name, "w")
                 # Datasets, queue, and writer thread are created lazily on
                 # the first frame of each FrameType.
                 self._h5_datasets = {}
@@ -667,6 +674,16 @@ class HDF5Plugin(PVGroup):
 
         with self._lock:
             if self._h5_file is not None:
+                # Snapshot the file handle upfront so it stays reachable
+                # from finally even if any of the pre-close writes raise.
+                # PRIOR BUG: if any dataset trim / /defaults create_dataset
+                # threw, control jumped to `except` and h5py.File.close()
+                # was skipped — leaving the file's superblock consistency
+                # flag set, so readers (tomocupy, tomogui) failed on the
+                # next open with "file is already open for write". Now
+                # close() lives in its own finally: nothing can bypass it.
+                h5file = self._h5_file
+                closed_path = h5file.filename
                 try:
                     # Layout mode close: LayoutWriter handles per-detector
                     # dataset trimming, OnFileClose ndattr writes, and the
@@ -674,7 +691,7 @@ class HDF5Plugin(PVGroup):
                     if self._layout_writer is not None:
                         try:
                             self._layout_writer.close(
-                                self._h5_file, self._last_snapshot)
+                                h5file, self._last_snapshot)
                         except Exception:
                             logger.exception(
                                 "LayoutWriter.close failed — file may be "
@@ -684,7 +701,11 @@ class HDF5Plugin(PVGroup):
                         for ftype, ds in self._h5_datasets.items():
                             count = self._dataset_counts.get(ftype, 0)
                             if count < ds.shape[0]:
-                                ds.resize((count,) + ds.shape[1:])
+                                try:
+                                    ds.resize((count,) + ds.shape[1:])
+                                except Exception:
+                                    logger.exception(
+                                        "Failed to trim dataset %s", ftype)
 
                     # Write per-frame index arrays that tomoscan's
                     # add_theta() reads to identify projections / flats /
@@ -692,36 +713,51 @@ class HDF5Plugin(PVGroup):
                     # These live at /defaults/NDArrayUniqueId and
                     # /defaults/HDF5FrameLocation; LayoutWriter's catch-all
                     # excludes these two names by design to avoid a clash.
-                    if self._unique_ids and "/defaults/NDArrayUniqueId" not in self._h5_file:
-                        self._h5_file.create_dataset(
-                            "/defaults/NDArrayUniqueId",
-                            data=np.asarray(self._unique_ids, dtype=np.int32))
-                    if self._frame_locations and "/defaults/HDF5FrameLocation" not in self._h5_file:
-                        # Fixed-length bytes (matches areaDetector). Width
-                        # picked to fit the longest /exchange/* path used.
-                        max_len = max(len(loc) for loc in self._frame_locations)
-                        loc_arr = np.asarray(self._frame_locations,
-                                              dtype=f"|S{max_len}")
-                        self._h5_file.create_dataset(
-                            "/defaults/HDF5FrameLocation", data=loc_arr)
+                    try:
+                        if self._unique_ids and "/defaults/NDArrayUniqueId" not in h5file:
+                            h5file.create_dataset(
+                                "/defaults/NDArrayUniqueId",
+                                data=np.asarray(self._unique_ids, dtype=np.int32))
+                        if self._frame_locations and "/defaults/HDF5FrameLocation" not in h5file:
+                            max_len = max(len(loc) for loc in self._frame_locations)
+                            loc_arr = np.asarray(self._frame_locations,
+                                                  dtype=f"|S{max_len}")
+                            h5file.create_dataset(
+                                "/defaults/HDF5FrameLocation", data=loc_arr)
+                    except Exception:
+                        logger.exception(
+                            "Failed to write /defaults index datasets")
+                except Exception as exc:
+                    logger.error("HDF5 pre-close error: %s", exc)
+                finally:
+                    # Snapshot counts before we null them so the log line
+                    # still reports per-type totals.
+                    counts_snapshot = dict(self._dataset_counts)
+                    # ALWAYS close, no matter what happened above. Then
+                    # fire the async fsync. Any exception in close itself
+                    # is logged but must not prevent state reset.
+                    try:
+                        h5file.close()
+                    except Exception as exc:
+                        logger.error("HDF5 close() raised: %s", exc)
+                    self._h5_file = None
+                    self._h5_datasets = {}
+                    self._layout_writer = None
+                    self._last_snapshot = None
 
-                    # Capture the filename before closing — needed for the
-                    # post-close fsync that pushes NFS write-behind cache
-                    # out to the server.
-                    closed_path = self._h5_file.filename
-                    self._h5_file.close()
                     # NFS pathology: h5py.close() returns as soon as the
                     # bytes are in the Linux page cache (marked dirty);
-                    # the kernel then drains them to the NFS server in
-                    # the background — and while that drains, every other
-                    # op on the same mount gets queued behind it. fsync()
-                    # blocks until bytes are durable on the server. For a
-                    # multi-GB file on NFS that can take many seconds, so
-                    # we do it in a background thread and let _stop_capture
-                    # return immediately — otherwise the Qt GUI (or the
-                    # caproto putter that called us) would freeze for the
-                    # whole flush. WriterState_RBV stays "Closing" until
-                    # the fsync completes; "Done" only fires after.
+                    # the kernel drains them to the NFS server in the
+                    # background — and while that drains, every other op
+                    # on the same mount gets queued behind it. fsync()
+                    # blocks until bytes are durable on the server; for
+                    # multi-GB files on NFS that can take many seconds,
+                    # so we do it in a background thread and let
+                    # _stop_capture return immediately — otherwise the
+                    # Qt GUI or the caproto putter that called us would
+                    # freeze for the whole flush. WriterState_RBV stays
+                    # "Closing" until the fsync completes; "Done" only
+                    # fires after.
                     self._publish(self.WriterState_RBV, 2)  # Closing
                     self._publish(self.WriteMessage,
                                    "Flushing to disk (NFS sync)…")
@@ -732,19 +768,12 @@ class HDF5Plugin(PVGroup):
                         name="hdf5-fsync").start()
                     counts_str = ", ".join(
                         f"{ftype}={c}"
-                        for ftype, c in self._dataset_counts.items())
+                        for ftype, c in counts_snapshot.items())
                     msg = (f"HDF5: closed ({self._frames_captured} frames; "
                             f"{counts_str})")
                     if self._dropped_frames:
                         msg += f", {self._dropped_frames} dropped"
                     logger.info(msg)
-                except Exception as exc:
-                    logger.error("HDF5 close error: %s", exc)
-                finally:
-                    self._h5_file = None
-                    self._h5_datasets = {}
-                    self._layout_writer = None
-                    self._last_snapshot = None
 
         if _to_str(self.AutoIncrement.value) == "Yes":
             next_num = int(self.FileNumber.value) + 1

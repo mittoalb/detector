@@ -200,3 +200,70 @@ class TestWriterEndToEnd:
             w.close(f, snap)
             # Fallback path is /exchange/data
             assert path == "/exchange/data"
+
+    def test_tomoscan_add_theta_compatibility(self, outfile):
+        """Emulate tomoscan_32id.add_theta on our output to prove the
+        /defaults/{NDArrayUniqueId,HDF5FrameLocation} datasets tomoscan
+        reads are shaped correctly for theta assignment."""
+        layout = parse_layout_xml(FIXTURE)
+        rng = np.random.default_rng(0)
+
+        # Simulate a scan: 3 flats, 5 projections, 2 darks
+        unique_ids = []
+        frame_locations = []
+        with h5py.File(outfile, "w", libver="latest", locking=False) as f:
+            w = LayoutWriter(layout)
+            w.open(f, self._snap("/exchange/data_white"))
+            counter = 0
+            for _ in range(3):
+                counter += 1
+                snap = self._snap("/exchange/data_white")
+                w.write_frame(
+                    f, rng.integers(0, 65536, (8, 8), dtype=np.uint16), snap)
+                unique_ids.append(counter)
+                frame_locations.append(b"/exchange/data_white")
+            for _ in range(5):
+                counter += 1
+                snap = self._snap("/exchange/data")
+                w.write_frame(
+                    f, rng.integers(0, 65536, (8, 8), dtype=np.uint16), snap)
+                unique_ids.append(counter)
+                frame_locations.append(b"/exchange/data")
+            for _ in range(2):
+                counter += 1
+                snap = self._snap("/exchange/data_dark")
+                w.write_frame(
+                    f, rng.integers(0, 65536, (8, 8), dtype=np.uint16), snap)
+                unique_ids.append(counter)
+                frame_locations.append(b"/exchange/data_dark")
+
+            # Simulate what hdf5_plugin does at close (the legacy /defaults
+            # writes that layout mode intentionally does not touch)
+            w.close(f, self._snap("/exchange/data"))
+            f.create_dataset(
+                "/defaults/NDArrayUniqueId",
+                data=np.asarray(unique_ids, dtype=np.int32))
+            max_len = max(len(x) for x in frame_locations)
+            f.create_dataset(
+                "/defaults/HDF5FrameLocation",
+                data=np.asarray(frame_locations, dtype=f"|S{max_len}"))
+
+        # Now emulate tomoscan_32id.add_theta
+        my_theta = np.linspace(0, 180, 5, endpoint=False, dtype=np.float32)
+        with h5py.File(outfile, "a") as f:
+            ids = f["/defaults/NDArrayUniqueId"][:]
+            locs = f["/defaults/HDF5FrameLocation"][:]
+            proj_ids = ids[locs == b"/exchange/data"]
+            flat_ids = ids[locs == b"/exchange/data_white"]
+            dark_ids = ids[locs == b"/exchange/data_dark"]
+            assert len(proj_ids) == 5
+            assert len(flat_ids) == 3
+            assert len(dark_ids) == 2
+            # This is the crucial line — same code tomoscan runs. If our
+            # /defaults labels are wrong, len(proj_ids) != len(my_theta)
+            # and the assignment raises or fills with zeros.
+            theta_ds = f.create_dataset("/exchange/theta", (len(proj_ids),))
+            theta_ds[:] = my_theta[proj_ids - proj_ids[0]]
+
+        with h5py.File(outfile, "r") as f:
+            assert list(f["/exchange/theta"][:]) == list(my_theta)
